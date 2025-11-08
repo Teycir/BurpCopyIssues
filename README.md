@@ -1,14 +1,49 @@
 # BurpCopyIssues
 
-Burp Suite extension for browsing, copying, and exporting scan findings to use with AI tools.
+![Python](https://img.shields.io/badge/python-2.7-blue.svg)
+![Burp Suite](https://img.shields.io/badge/Burp%20Suite-Pro%20%7C%20Community-orange.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 
-## Quick Start
+Burp Suite extension for browsing, copying, and exporting scan findings.
+
+<p align="center">
+  <img src="Assets/selecteditem.png" alt="Selected Item">
+</p>
+
+## Why BurpCopyIssues?
+
+### Use Cases
+- **Penetration Testing Reports**: Quickly copy findings into report templates with full technical details
+- **Bug Bounty Hunting**: Export structured vulnerability data with HTTP evidence for submissions
+- **Security Research**: Organize and track findings across multiple targets with status flags
+- **Team Collaboration**: Share standardized JSON exports with complete request/response data
+- **Vulnerability Management**: Track testing progress with Tested/Exploited/False Positive markers
+- **Automation & Integration**: Use JSON exports with curl commands and Python templates for validation
+
+### Key Benefits
+- **Time Savings**: One-click copy eliminates manual formatting of vulnerability details
+- **Complete Context**: Every export includes full HTTP evidence, not just summaries
+- **Smart Deduplication**: Automatically identifies unique vs duplicate findings across hosts
+- **Persistent Tracking**: Status flags survive Burp restarts for long-term project management
+- **Ready-to-Use**: Exports include working curl commands and Python scripts for immediate testing
+- **Visual Clarity**: Color-coded UI with alternating rows makes scanning hundreds of findings effortless
+
+### What Makes It Different
+- **No Manual Copying**: Double-click to copy complete vulnerability details to clipboard
+- **HTTP Evidence Included**: Full request/response pairs with headers and bodies
+- **Executable Exports**: curl commands and Python scripts ready to run
+- **Status Persistence**: Track your testing workflow across sessions
+- **Duplicate Intelligence**: Instantly see which findings are unique vs repeated
+- **Organized Exports**: Structured by severity/confidence with statistics and test scripts
+
+## Installation & Quick Start
 
 1. Burp → Extender → Extensions → Add → Python
 2. Select: `CopyIssues.py`
 3. Click severity/confidence filter (e.g., "High - Certain")
 4. Double-click any issue to copy to clipboard
-5. Paste into any AI tool (Amazon Q, ChatGPT, Claude, etc.)
+5. Paste into your preferred tool or documentation
 
 ## Requirements
 
@@ -31,10 +66,18 @@ Interactive UI extension for browsing, copying, and exporting scan findings.
 - Export all issues to JSON with full HTTP evidence
 
 **Usage:**
-- Click severity/confidence filter → Double-click issue → Paste into AI
+- Click severity/confidence filter → Double-click issue → Copy to clipboard
 - Use checkboxes to mark status (Tested/Exploited/False Positive)
 - Click "Refresh" to reload findings
 - Click "Export All" for JSON export with full HTTP evidence
+
+<p align="center">
+  <img src="Assets/groupbyhost.png" alt="Group by Host">
+</p>
+
+<p align="center">
+  <img src="Assets/research.png" alt="Research View">
+</p>
 
 ## Output Structure
 
@@ -52,6 +95,10 @@ Interactive UI extension for browsing, copying, and exporting scan findings.
     ├── firm.json
     └── tentative.json
 ```
+
+<p align="center">
+  <img src="Assets/exportedfolder.png" alt="Exported Folder">
+</p>
 
 ## JSON Export Contents
 
@@ -85,13 +132,14 @@ Issues are grouped by host + vulnerability type:
 
 ## Supported Vulnerabilities
 
-Focuses on High/Medium severity:
+Displays all High and Medium severity issues detected by Burp Scanner, including but not limited to:
 - SQL injection, XSS, Code/Command injection
 - Path traversal, XXE, SSRF, Deserialization
 - Authentication bypass, CSRF, CORS
 - File upload, Template injection
 - Host header attacks, Open redirect
 - LDAP injection, HTTP smuggling
+- And any other High/Medium severity findings from Burp's scanner
 
 ## Technical Details
 
@@ -107,6 +155,26 @@ Focuses on High/Medium severity:
 - **Cross-platform**: Works on Windows, Linux, and macOS
 - **Performance**: Limited to first 2 HTTP messages per issue, 20 headers max
 
+## Changelog
+
+### v1.0.0 (2024)
+- Initial release
+- Filter by severity (High/Medium) and confidence (Certain/Firm/Tentative)
+- Double-click to copy issue details to clipboard
+- Color-coded UI with alternating row backgrounds
+- Status tracking (Tested/Exploited/False Positive)
+- Duplicate detection with [UNIQUE] markers
+- JSON export with full HTTP evidence
+- curl commands and Python request templates
+- Search and sort functionality
+- Group by host feature
+- Cross-platform support (Windows/Linux/macOS)
+- Status persistence across Burp restarts
+
+## Author
+
+Developed by [Teycir Ben Soltane](https://teycirbensoltane.tn)
+
 ## License
 
-Use at your own risk. Authorized testing only.
+MIT License - Free to use for authorized security testing and research purposes.
