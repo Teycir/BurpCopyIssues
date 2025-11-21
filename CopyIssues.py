@@ -107,8 +107,6 @@ class BurpExtender(IBurpExtender, ITab):
         med_tentative.addActionListener(lambda e: self.load_issues("Medium", "Tentative"))
         self.filter_buttons[("Medium", "Tentative")] = med_tentative
         
-        self._update_button_counts()
-        
         export_btn = JButton("Export All")
         export_btn.setBackground(Color(40, 167, 69))
         export_btn.setForeground(Color.WHITE)
@@ -130,6 +128,9 @@ class BurpExtender(IBurpExtender, ITab):
         
         self._panel.add(btn_panel, BorderLayout.NORTH)
         callbacks.addSuiteTab(self)
+        
+        # Update button counts after tab is added
+        self._update_button_counts()
 
     def getTabCaption(self):
         count = self.list_model.getSize()
@@ -139,6 +140,7 @@ class BurpExtender(IBurpExtender, ITab):
         return self._panel
     
     def refresh_current(self):
+        self._update_button_counts()
         if self.current_filter["severity"] and self.current_filter["confidence"]:
             self.copied_indices.clear()
             self.load_issues(self.current_filter["severity"], self.current_filter["confidence"])
