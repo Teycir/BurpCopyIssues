@@ -1,10 +1,10 @@
 # pylint: disable=import-error
 from burp import IBurpExtender, ITab
-from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox
+from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer
 from java.awt import BorderLayout, GridLayout, Toolkit, Color, Font, FlowLayout, Component
 from javax.swing.event import DocumentListener
 from java.awt.datatransfer import StringSelection
-from java.awt.event import MouseAdapter
+from java.awt.event import MouseAdapter, ActionListener
 from java.io import File, FileWriter, FileReader, BufferedReader
 from java.text import SimpleDateFormat
 from java.util import Date
@@ -131,6 +131,10 @@ class BurpExtender(IBurpExtender, ITab):
         
         # Update button counts after tab is added
         self._update_button_counts()
+        
+        # Start timer to auto-refresh counts every 3 seconds
+        self.timer = Timer(3000, UpdateCountsListener(self))
+        self.timer.start()
 
     def getTabCaption(self):
         count = self.list_model.getSize()
@@ -145,7 +149,7 @@ class BurpExtender(IBurpExtender, ITab):
             self.copied_indices.clear()
             self.load_issues(self.current_filter["severity"], self.current_filter["confidence"])
         else:
-            self._callbacks.printOutput("[!] No filter active - click a severity/confidence button first")
+            JOptionPane.showMessageDialog(self._panel, "Counts refreshed! Click a filter to view issues.", "Refreshed", JOptionPane.INFORMATION_MESSAGE)
     
     def _update_button_counts(self):
         all_issues = self._callbacks.getScanIssues(None)
@@ -163,6 +167,7 @@ class BurpExtender(IBurpExtender, ITab):
             btn.setText(text)
     
     def load_issues(self, severity, confidence):
+        self._update_button_counts()
         self.current_filter = {"severity": severity, "confidence": confidence}
         self.copied_indices.clear()
         self.duplicate_indices.clear()
@@ -221,16 +226,16 @@ class BurpExtender(IBurpExtender, ITab):
                                 body = "\nBody: {}\n".format(body_content)
                         
                         http_data = "\n=== HTTP REQUEST ===\n{}\n{}{}\n".format(method_line, headers, body)
-                except:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error extracting HTTP data: " + str(e))
                 
                 references = ""
                 try:
                     refs = issue.getReferences()
                     if refs:
                         references = "\n\nReferences:\n" + '\n'.join(['- ' + str(r) for r in refs[:3]])
-                except:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error extracting references: " + str(e))
                 
                 prompt = """=== BURP SCAN FINDING ===
 Severity: {} (Confidence: {})
@@ -253,7 +258,7 @@ Remediation:
                 self.issues_cache[key]["prompt"] = prompt
                 self.all_issues_data.append({"key": key, "host": host, "issue_name": issue_name, "url": str(issue.getUrl())})
             except Exception as e:
-                self._callbacks.printError("Error processing issue")
+                self._callbacks.printError("Error processing issue: " + str(e))
         
         self._callbacks.printOutput("[+] Loaded {} {} {} issues".format(len(issues), severity, confidence))
         self._callbacks.setExtensionName("CopyIssues ({})".format(len(issues)))
@@ -308,7 +313,8 @@ Remediation:
             try:
                 File(path).mkdirs()
                 return path
-            except Exception:
+            except Exception as e:
+                self._callbacks.printError("Error creating export dir: " + str(e))
                 continue
         return None
     
@@ -464,8 +470,8 @@ Remediation:
                     if writer:
                         try:
                             writer.close()
-                        except:
-                            pass
+                        except Exception as e:
+                            self._callbacks.printError("Error closing file writer: " + str(e))
         
         # Generate stats
         stats = {"scan_timestamp": scan_timestamp, "total_issues": len(json_data), "by_severity": {}, "by_confidence": {}, "by_host": {}}
@@ -483,8 +489,8 @@ Remediation:
             if writer:
                 try:
                     writer.close()
-                except:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error closing stats writer: " + str(e))
         
         # Generate README
         readme = "# Burp Export - {}\n\nTotal: {} issues\nHigh: {}\nMedium: {}\nHosts: {}\n\n".format(
@@ -504,8 +510,8 @@ Remediation:
             if writer:
                 try:
                     writer.close()
-                except:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error closing README writer: " + str(e))
         
         # Generate test script
         script_content = ""
@@ -542,8 +548,8 @@ Remediation:
                 try:
                     import stat
                     os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error setting chmod: " + str(e))
         
         JOptionPane.showMessageDialog(self._panel, "Exported {} issues to:\n{}".format(total, base_dir), "Success", JOptionPane.INFORMATION_MESSAGE)
         self._callbacks.printOutput("[+] Exported {} issues to {}".format(total, base_dir))
@@ -621,14 +627,15 @@ Remediation:
                 content += line
                 line = reader.readLine()
             return content
-        except Exception:
+        except Exception as e:
+            self._callbacks.printError("Error reading file: " + str(e))
             return None
         finally:
             if reader:
                 try:
                     reader.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error closing reader: " + str(e))
     
     def _write_file(self, filepath, content):
         writer = None
@@ -636,14 +643,15 @@ Remediation:
             writer = FileWriter(filepath)
             writer.write(content)
             return True
-        except Exception:
+        except Exception as e:
+            self._callbacks.printError("Error writing file: " + str(e))
             return False
         finally:
             if writer:
                 try:
                     writer.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._callbacks.printError("Error closing file writer: " + str(e))
     
     def _load_status(self):
         status_file = self._get_status_file()
@@ -651,8 +659,8 @@ Remediation:
         if content:
             try:
                 return json.loads(content)
-            except Exception:
-                pass
+            except Exception as e:
+                self._callbacks.printError("Error loading status: " + str(e))
         return {}
     
     def _save_status(self):
@@ -779,3 +787,10 @@ class SearchListener(DocumentListener):
     
     def changedUpdate(self, e):
         self.extender._apply_filters()
+
+class UpdateCountsListener(ActionListener):
+    def __init__(self, extender):
+        self.extender = extender
+    
+    def actionPerformed(self, e):
+        self.extender._update_button_counts()
