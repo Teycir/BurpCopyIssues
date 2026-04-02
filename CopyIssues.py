@@ -1,6 +1,6 @@
 # pylint: disable=import-error
 from burp import IBurpExtender, ITab, IExtensionStateListener, IScannerListener
-from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer, SwingUtilities
+from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer, SwingUtilities, ListSelectionModel
 from java.awt import BorderLayout, GridLayout, Toolkit, Color, Font, FlowLayout, Component
 from javax.swing.event import DocumentListener
 from java.awt.datatransfer import StringSelection
@@ -25,12 +25,15 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         self.issues_cache = {}
         self.all_issues_data = []
         self.issue_status = self._load_status()
+        self.issue_notes = self._load_notes()
+        self.filter_presets = self._load_presets()
         self.copied_issue_keys = set()
         self.duplicate_issue_keys = set()
         self.displayed_rows = []
         self.group_by_host = False
         self.list_model = DefaultListModel()
         self.issue_list = JList(self.list_model)
+        self.issue_list.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.issue_list.setFont(Font("Monospaced", Font.PLAIN, 12))
         self.issue_list.setCellRenderer(AlternatingRowRenderer(self))
         self.issue_list.addMouseListener(DoubleClickListener(self))
@@ -56,9 +59,12 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         
         center_panel = JPanel(BorderLayout())
         
+        filters_container = JPanel()
+        filters_container.setLayout(BoxLayout(filters_container, BoxLayout.Y_AXIS))
+
         search_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         search_panel.add(JLabel("Search:"))
-        self.search_field = JTextField(30)
+        self.search_field = JTextField(24)
         self.search_field.getDocument().addDocumentListener(SearchListener(self))
         search_panel.add(self.search_field)
         search_panel.add(JLabel("Sort:"))
@@ -68,12 +74,57 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         self.group_btn = JButton("Group by Host")
         self.group_btn.addActionListener(lambda e: self._toggle_grouping())
         search_panel.add(self.group_btn)
-        center_panel.add(search_panel, BorderLayout.NORTH)
+        search_panel.add(JLabel("Status:"))
+        self.status_filter_combo = JComboBox(["Any Status", "Tested", "Exploited", "False Positive", "Untagged"])
+        self.status_filter_combo.addActionListener(lambda e: self._apply_filters())
+        search_panel.add(self.status_filter_combo)
+        self.only_unique_cb = JCheckBox("Only Unique")
+        self.only_unique_cb.addActionListener(lambda e: self._apply_filters())
+        search_panel.add(self.only_unique_cb)
+        filters_container.add(search_panel)
+
+        advanced_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        advanced_panel.add(JLabel("Host Regex:"))
+        self.host_regex_field = JTextField(12)
+        self.host_regex_field.getDocument().addDocumentListener(SearchListener(self))
+        advanced_panel.add(self.host_regex_field)
+        advanced_panel.add(JLabel("Path Regex:"))
+        self.path_regex_field = JTextField(12)
+        self.path_regex_field.getDocument().addDocumentListener(SearchListener(self))
+        advanced_panel.add(self.path_regex_field)
+        advanced_panel.add(JLabel("Type Regex:"))
+        self.type_regex_field = JTextField(12)
+        self.type_regex_field.getDocument().addDocumentListener(SearchListener(self))
+        advanced_panel.add(self.type_regex_field)
+        filters_container.add(advanced_panel)
+
+        preset_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        preset_panel.add(JLabel("Preset:"))
+        self.preset_combo = JComboBox(["(No Preset)"])
+        preset_panel.add(self.preset_combo)
+        save_preset_btn = JButton("Save Preset")
+        save_preset_btn.addActionListener(lambda e: self._save_current_preset())
+        preset_panel.add(save_preset_btn)
+        load_preset_btn = JButton("Apply Preset")
+        load_preset_btn.addActionListener(lambda e: self._apply_selected_preset())
+        preset_panel.add(load_preset_btn)
+        delete_preset_btn = JButton("Delete Preset")
+        delete_preset_btn.addActionListener(lambda e: self._delete_selected_preset())
+        preset_panel.add(delete_preset_btn)
+        filters_container.add(preset_panel)
+
+        self.filter_status_label = JLabel("")
+        self.filter_status_label.setFont(Font("Monospaced", Font.PLAIN, 11))
+        filters_container.add(self.filter_status_label)
+        center_panel.add(filters_container, BorderLayout.NORTH)
         
         list_scroll = JScrollPane(self.issue_list)
         list_scroll.setBorder(BorderFactory.createTitledBorder("Scan Issues (Double-click to copy)"))
         center_panel.add(list_scroll, BorderLayout.CENTER)
         
+        workflow_panel = JPanel()
+        workflow_panel.setLayout(BoxLayout(workflow_panel, BoxLayout.Y_AXIS))
+
         status_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.tested_cb = JCheckBox("Tested")
         self.exploited_cb = JCheckBox("Exploited")
@@ -87,12 +138,44 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         status_panel.add(self.exploited_cb)
         status_panel.add(self.fp_cb)
         status_panel.add(clear_btn)
-        center_panel.add(status_panel, BorderLayout.SOUTH)
+        workflow_panel.add(status_panel)
+
+        bulk_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        bulk_tested_btn = JButton("Bulk Tested")
+        bulk_tested_btn.addActionListener(lambda e: self._apply_bulk_status("tested"))
+        bulk_exploited_btn = JButton("Bulk Exploited")
+        bulk_exploited_btn.addActionListener(lambda e: self._apply_bulk_status("exploited"))
+        bulk_fp_btn = JButton("Bulk FP")
+        bulk_fp_btn.addActionListener(lambda e: self._apply_bulk_status("fp"))
+        bulk_clear_btn = JButton("Bulk Clear")
+        bulk_clear_btn.addActionListener(lambda e: self._apply_bulk_status("clear"))
+        copy_selected_btn = JButton("Copy Selected")
+        copy_selected_btn.addActionListener(lambda e: self._copy_selected_issues())
+        bulk_panel.add(bulk_tested_btn)
+        bulk_panel.add(bulk_exploited_btn)
+        bulk_panel.add(bulk_fp_btn)
+        bulk_panel.add(bulk_clear_btn)
+        bulk_panel.add(copy_selected_btn)
+        workflow_panel.add(bulk_panel)
+
+        notes_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        notes_panel.add(JLabel("Note:"))
+        self.note_field = JTextField(55)
+        notes_panel.add(self.note_field)
+        save_note_btn = JButton("Save Note")
+        save_note_btn.addActionListener(lambda e: self._save_note_for_selected())
+        clear_note_btn = JButton("Clear Note")
+        clear_note_btn.addActionListener(lambda e: self._clear_note_for_selected())
+        notes_panel.add(save_note_btn)
+        notes_panel.add(clear_note_btn)
+        workflow_panel.add(notes_panel)
+
+        center_panel.add(workflow_panel, BorderLayout.SOUTH)
         
         self._panel.add(center_panel, BorderLayout.CENTER)
         self.issue_list.addListSelectionListener(lambda e: self._on_selection_change() if not e.getValueIsAdjusting() else None)
         
-        btn_panel = JPanel(GridLayout(3, 3, 5, 5))
+        btn_panel = JPanel(GridLayout(4, 3, 5, 5))
         btn_panel.setBorder(BorderFactory.createEmptyBorder(0, 0, 10, 0))
         
         high_certain = JButton("High - Certain")
@@ -131,6 +214,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         self.export_btn.setBackground(Color(40, 167, 69))
         self.export_btn.setForeground(Color.WHITE)
         self.export_btn.addActionListener(lambda e: self.export_all())
+        self.export_profile_combo = JComboBox(["Evidence", "Quick", "Submission", "Dev Ticket"])
 
         self.cancel_export_btn = JButton("Cancel Export")
         self.cancel_export_btn.setBackground(Color(220, 53, 69))
@@ -149,6 +233,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         btn_panel.add(med_certain)
         btn_panel.add(med_firm)
         btn_panel.add(med_tentative)
+        btn_panel.add(self.export_profile_combo)
         btn_panel.add(self.export_btn)
         btn_panel.add(refresh_btn)
         btn_panel.add(self.cancel_export_btn)
@@ -165,6 +250,8 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
             self._scanner_listener_registered = True
         except Exception as e:
             self._callbacks.printError("Scanner listener registration failed: " + str(e))
+
+        self._refresh_preset_combo()
         
         # Start with zeroed counters and refresh asynchronously.
         self._apply_button_counts({})
@@ -209,6 +296,215 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
             self._issue_cache_timestamp = 0
             self._issues_by_filter = {}
             self._count_cache = {}
+
+    def _build_issue_id(self, host, issue_url, issue_name):
+        return hashlib.md5("{}{}{}".format(host, issue_url, issue_name).encode('utf-8')).hexdigest()
+
+    def _compile_filter_regex(self, pattern):
+        value = pattern.strip()
+        if not value:
+            return None, None
+        try:
+            return re.compile(value, re.IGNORECASE), None
+        except Exception as e:
+            return None, str(e)
+
+    def _issue_matches_status_filter(self, issue_id):
+        status_filter = str(self.status_filter_combo.getSelectedItem())
+        if status_filter == "Any Status":
+            return True
+        status = self.issue_status.get(issue_id, {})
+        if status_filter == "Tested":
+            return status.get("tested", False)
+        if status_filter == "Exploited":
+            return status.get("exploited", False)
+        if status_filter == "False Positive":
+            return status.get("fp", False)
+        if status_filter == "Untagged":
+            return not (status.get("tested", False) or status.get("exploited", False) or status.get("fp", False))
+        return True
+
+    def _get_selected_issue_keys(self):
+        selected_keys = []
+        indices = self.issue_list.getSelectedIndices()
+        for idx in indices:
+            if idx < 0 or idx >= len(self.displayed_rows):
+                continue
+            row = self.displayed_rows[idx]
+            if row.get("type") == "issue" and row.get("issue_key"):
+                selected_keys.append(row.get("issue_key"))
+        return selected_keys
+
+    def _copy_selected_issues(self):
+        selected_keys = self._get_selected_issue_keys()
+        if not selected_keys:
+            JOptionPane.showMessageDialog(self._panel, "Select one or more issue rows first.", "Info", JOptionPane.INFORMATION_MESSAGE)
+            return
+
+        prompts = []
+        for key in selected_keys:
+            issue_data = self.issues_cache.get(key)
+            if not issue_data:
+                continue
+            prompt = issue_data.get("prompt")
+            if not prompt:
+                prompt = self._build_issue_prompt(issue_data.get("issue"))
+                issue_data["prompt"] = prompt
+            if prompt:
+                prompts.append(prompt)
+                self.copied_issue_keys.add(key)
+
+        if not prompts:
+            JOptionPane.showMessageDialog(self._panel, "No prompts were available for selected rows.", "Error", JOptionPane.ERROR_MESSAGE)
+            return
+
+        try:
+            combined = "\n\n" + ("=" * 80) + "\n\n"
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(combined.join(prompts)), None)
+            self.issue_list.repaint()
+            JOptionPane.showMessageDialog(self._panel, "Copied {} issues to clipboard.".format(len(prompts)), "Success", JOptionPane.INFORMATION_MESSAGE)
+        except Exception as e:
+            JOptionPane.showMessageDialog(self._panel, "Failed: " + str(e), "Error", JOptionPane.ERROR_MESSAGE)
+
+    def _apply_bulk_status(self, action):
+        selected_keys = self._get_selected_issue_keys()
+        if not selected_keys:
+            JOptionPane.showMessageDialog(self._panel, "Select one or more issue rows first.", "Info", JOptionPane.INFORMATION_MESSAGE)
+            return
+
+        updates = 0
+        for key in selected_keys:
+            issue_data = self.issues_cache.get(key)
+            if not issue_data:
+                continue
+            issue_id = issue_data.get("id")
+            if not issue_id:
+                continue
+
+            if action == "clear":
+                if issue_id in self.issue_status:
+                    del self.issue_status[issue_id]
+                    updates += 1
+                continue
+
+            current = self.issue_status.get(issue_id, {"tested": False, "exploited": False, "fp": False})
+            current[action] = True
+            self.issue_status[issue_id] = current
+            updates += 1
+
+        if updates:
+            self._save_status()
+            self._refresh_list_view()
+            self.issue_list.repaint()
+
+        if len(selected_keys) == 1:
+            self._on_selection_change()
+
+        JOptionPane.showMessageDialog(self._panel, "Updated {} issues.".format(updates), "Bulk Action", JOptionPane.INFORMATION_MESSAGE)
+
+    def _save_note_for_selected(self):
+        issue_key = self._get_selected_issue_key()
+        if not issue_key:
+            JOptionPane.showMessageDialog(self._panel, "Select an issue row first.", "Info", JOptionPane.INFORMATION_MESSAGE)
+            return
+        issue_data = self.issues_cache.get(issue_key)
+        if not issue_data:
+            return
+        issue_id = issue_data.get("id")
+        if not issue_id:
+            return
+
+        note_text = str(self.note_field.getText()).strip()
+        if note_text:
+            self.issue_notes[issue_id] = note_text
+        elif issue_id in self.issue_notes:
+            del self.issue_notes[issue_id]
+        self._save_notes()
+
+    def _clear_note_for_selected(self):
+        issue_key = self._get_selected_issue_key()
+        if not issue_key:
+            return
+        issue_data = self.issues_cache.get(issue_key)
+        if not issue_data:
+            return
+        issue_id = issue_data.get("id")
+        if issue_id in self.issue_notes:
+            del self.issue_notes[issue_id]
+            self._save_notes()
+        self.note_field.setText("")
+
+    def _refresh_preset_combo(self):
+        items = ["(No Preset)"] + sorted(self.filter_presets.keys())
+        current = self.preset_combo.getSelectedItem()
+        current_value = str(current) if current else None
+        self.preset_combo.removeAllItems()
+        for item in items:
+            self.preset_combo.addItem(item)
+        if current_value and current_value in items:
+            self.preset_combo.setSelectedItem(current_value)
+        else:
+            self.preset_combo.setSelectedIndex(0)
+
+    def _capture_current_filters(self):
+        return {
+            "search": str(self.search_field.getText()),
+            "sort": str(self.sort_combo.getSelectedItem()),
+            "group_by_host": self.group_by_host,
+            "host_regex": str(self.host_regex_field.getText()),
+            "path_regex": str(self.path_regex_field.getText()),
+            "type_regex": str(self.type_regex_field.getText()),
+            "status_filter": str(self.status_filter_combo.getSelectedItem()),
+            "only_unique": self.only_unique_cb.isSelected(),
+            "severity": self.current_filter.get("severity"),
+            "confidence": self.current_filter.get("confidence")
+        }
+
+    def _save_current_preset(self):
+        name = JOptionPane.showInputDialog(self._panel, "Preset name:")
+        if not name:
+            return
+        clean_name = name.strip()
+        if not clean_name:
+            return
+        self.filter_presets[clean_name] = self._capture_current_filters()
+        self._save_presets()
+        self._refresh_preset_combo()
+        self.preset_combo.setSelectedItem(clean_name)
+
+    def _apply_selected_preset(self):
+        name = str(self.preset_combo.getSelectedItem())
+        if not name or name == "(No Preset)":
+            return
+        preset = self.filter_presets.get(name)
+        if not preset:
+            return
+
+        self.search_field.setText(preset.get("search", ""))
+        self.sort_combo.setSelectedItem(preset.get("sort", "Default"))
+        self.host_regex_field.setText(preset.get("host_regex", ""))
+        self.path_regex_field.setText(preset.get("path_regex", ""))
+        self.type_regex_field.setText(preset.get("type_regex", ""))
+        self.status_filter_combo.setSelectedItem(preset.get("status_filter", "Any Status"))
+        self.only_unique_cb.setSelected(preset.get("only_unique", False))
+        self.group_by_host = preset.get("group_by_host", False)
+        self.group_btn.setText("Ungroup" if self.group_by_host else "Group by Host")
+
+        severity = preset.get("severity")
+        confidence = preset.get("confidence")
+        if severity and confidence:
+            self.load_issues(severity, confidence)
+        else:
+            self._refresh_list_view()
+
+    def _delete_selected_preset(self):
+        name = str(self.preset_combo.getSelectedItem())
+        if not name or name == "(No Preset)":
+            return
+        if name in self.filter_presets:
+            del self.filter_presets[name]
+            self._save_presets()
+            self._refresh_preset_combo()
     
     def refresh_current(self):
         self._request_count_refresh(force=True)
@@ -354,7 +650,12 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
                     host = service.getHost() if service else ""
                     issue_name = issue.getIssueName()
                     issue_url = str(issue.getUrl())
-                    issue_id = hashlib.md5("{}{}{}".format(host, issue_url, issue_name).encode('utf-8')).hexdigest()
+                    issue_id = self._build_issue_id(host, issue_url, issue_name)
+                    issue_path = ""
+                    try:
+                        issue_path = issue.getUrl().getPath() or ""
+                    except Exception:
+                        issue_path = ""
 
                     key = "[{}] {} - {}".format(idx + 1, issue_name, issue_url)
                     dup_key = "{}:{}".format(host, issue_name)
@@ -362,7 +663,14 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
                         duplicate_issue_keys.add(key)
 
                     cache[key] = {"prompt": None, "id": issue_id, "issue": issue}
-                    rows.append({"key": key, "host": host, "issue_name": issue_name, "url": issue_url})
+                    rows.append({
+                        "key": key,
+                        "id": issue_id,
+                        "host": host,
+                        "path": issue_path,
+                        "issue_name": issue_name,
+                        "url": issue_url
+                    })
                 except Exception as e:
                     self._callbacks.printError("Error processing issue: " + str(e))
 
@@ -436,6 +744,21 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListene
         except Exception as e:
             self._callbacks.printError("Error extracting references: " + str(e))
 
+        issue_id = None
+        try:
+            http_messages = issue.getHttpMessages()
+            service = http_messages[0].getHttpService() if http_messages else None
+            host = service.getHost() if service else ""
+            issue_id = self._build_issue_id(host, str(issue.getUrl()), issue.getIssueName())
+        except Exception:
+            issue_id = None
+
+        notes_text = ""
+        if issue_id:
+            note_value = self.issue_notes.get(issue_id)
+            if note_value:
+                notes_text = "\nAnalyst Notes:\n{}\n".format(note_value)
+
         return """=== BURP SCAN FINDING ===
 Severity: {} (Confidence: {})
 Issue: {}
@@ -448,11 +771,11 @@ Background:
 {}
 
 Remediation:
-{}{}{}
+{}{}{}{}
 """.format(issue.getSeverity(), issue.getConfidence(), issue.getIssueName(),
            str(issue.getUrl()), issue.getIssueDetail() or "No details",
            issue.getIssueBackground() or "N/A",
-           issue.getRemediationDetail() or "N/A", references, http_data)
+           issue.getRemediationDetail() or "N/A", references, http_data, notes_text)
     
     def _apply_filters(self):
         self._refresh_list_view()
@@ -464,10 +787,38 @@ Remediation:
             self.list_model.addElement(row["text"])
 
     def _refresh_list_view(self):
-        search_text = self.search_field.getText().lower()
-        sort_by = self.sort_combo.getSelectedItem()
+        search_text = str(self.search_field.getText()).lower()
+        sort_by = str(self.sort_combo.getSelectedItem())
+        host_regex, host_error = self._compile_filter_regex(str(self.host_regex_field.getText()))
+        path_regex, path_error = self._compile_filter_regex(str(self.path_regex_field.getText()))
+        type_regex, type_error = self._compile_filter_regex(str(self.type_regex_field.getText()))
+        regex_errors = []
+        if host_error:
+            regex_errors.append("host")
+        if path_error:
+            regex_errors.append("path")
+        if type_error:
+            regex_errors.append("type")
+        if regex_errors:
+            self.filter_status_label.setText("Invalid regex: " + ", ".join(regex_errors))
+        else:
+            self.filter_status_label.setText("")
 
-        filtered = [d for d in self.all_issues_data if search_text in d["key"].lower()]
+        filtered = []
+        for issue in self.all_issues_data:
+            if search_text and search_text not in issue["key"].lower():
+                continue
+            if host_regex and not host_regex.search(issue.get("host", "")):
+                continue
+            if path_regex and not path_regex.search(issue.get("path", "")):
+                continue
+            if type_regex and not type_regex.search(issue.get("issue_name", "")):
+                continue
+            if self.only_unique_cb.isSelected() and issue["key"] in self.duplicate_issue_keys:
+                continue
+            if not self._issue_matches_status_filter(issue.get("id")):
+                continue
+            filtered.append(issue)
 
         if sort_by == "Host":
             filtered.sort(key=lambda x: x["host"])
@@ -509,13 +860,8 @@ Remediation:
         self._callbacks.setExtensionName("CopyIssues ({})".format(len(filtered)))
 
     def _get_selected_issue_key(self):
-        idx = self.issue_list.getSelectedIndex()
-        if idx < 0 or idx >= len(self.displayed_rows):
-            return None
-        row = self.displayed_rows[idx]
-        if row.get("type") != "issue":
-            return None
-        return row.get("issue_key")
+        selected = self._get_selected_issue_keys()
+        return selected[0] if selected else None
     
     def _toggle_grouping(self):
         self.group_by_host = not self.group_by_host
@@ -547,9 +893,10 @@ Remediation:
             self._export_running = True
             self._export_cancel_requested = False
 
+        profile = str(self.export_profile_combo.getSelectedItem())
         self._set_export_ui_state(True)
-        self._set_export_status("Exporting issues...")
-        worker = threading.Thread(target=self._export_all_worker)
+        self._set_export_status("Exporting issues ({})...".format(profile))
+        worker = threading.Thread(target=self._export_all_worker, args=(profile,))
         worker.setDaemon(True)
         worker.start()
 
@@ -577,7 +924,102 @@ Remediation:
             self._export_cancel_requested = False
         self._run_on_ui(lambda: self._set_export_ui_state(False))
 
-    def _export_all_worker(self):
+    def _status_tags(self, issue_id):
+        status = self.issue_status.get(issue_id, {})
+        tags = []
+        if status.get("tested"):
+            tags.append("Tested")
+        if status.get("exploited"):
+            tags.append("Exploited")
+        if status.get("fp"):
+            tags.append("False Positive")
+        return tags
+
+    def _sanitize_headers(self, headers):
+        sanitized = []
+        for header in headers:
+            header_text = str(header)
+            lower = header_text.lower()
+            if lower.startswith("authorization:") or lower.startswith("cookie:") or lower.startswith("set-cookie:") or "token" in lower:
+                key = header_text.split(":", 1)[0]
+                sanitized.append(key + ": [REDACTED]")
+            else:
+                sanitized.append(header_text)
+        return sanitized
+
+    def _build_export_record(self, profile, base):
+        issue_id = base["id"]
+        status_tags = self._status_tags(issue_id)
+        note_text = self.issue_notes.get(issue_id, "")
+
+        if profile == "Quick":
+            return {
+                "id": issue_id,
+                "timestamp": base["timestamp"],
+                "severity": base["severity"],
+                "confidence": base["confidence"],
+                "host": base["host"],
+                "url": base["url"],
+                "finding": base["finding"],
+                "status": status_tags,
+                "notes": note_text
+            }
+
+        if profile == "Submission":
+            return {
+                "id": issue_id,
+                "timestamp": base["timestamp"],
+                "severity": base["severity"],
+                "confidence": base["confidence"],
+                "host": base["host"],
+                "url": base["url"],
+                "finding": base["finding"],
+                "description": base["description"],
+                "remediation": base["remediation"],
+                "status": status_tags,
+                "notes": note_text,
+                "insertion_points": base["insertion_points"],
+                "base_request": {
+                    "method": base["base_request"]["method"],
+                    "path": base["base_request"]["path"],
+                    "query_params": base["base_request"]["query_params"],
+                    "headers": self._sanitize_headers(base["base_request"]["headers"])
+                }
+            }
+
+        if profile == "Dev Ticket":
+            return {
+                "id": issue_id,
+                "ticket_title": "[{}] {}".format(base["severity"], base["finding"]),
+                "severity": base["severity"],
+                "confidence": base["confidence"],
+                "host": base["host"],
+                "url": base["url"],
+                "finding": base["finding"],
+                "curl_command": base["curl_command"],
+                "target": {
+                    "host": base["host"],
+                    "url": base["url"]
+                },
+                "problem": base["description"],
+                "background": base["background"],
+                "recommended_fix": base["remediation"],
+                "repro": {
+                    "insertion_points": base["insertion_points"],
+                    "curl_command": base["curl_command"],
+                    "python_template": base["python_request_template"]
+                },
+                "status": status_tags,
+                "notes": note_text
+            }
+
+        # Evidence profile (default)
+        evidence_record = dict(base)
+        evidence_record["status"] = status_tags
+        evidence_record["notes"] = note_text
+        return evidence_record
+
+    def _export_all_worker(self, profile):
         import os
         scan_timestamp = SimpleDateFormat("yyyyMMdd_HHmmss").format(Date())
         base_dir = self._get_export_dir("scan_{}".format(scan_timestamp))
@@ -619,8 +1061,7 @@ Remediation:
                     issue_name = issue.getIssueName()
                     confidence = issue.getConfidence()
 
-                    dedup_key = "{}{}{}".format(host, url, issue_name)
-                    issue_hash = hashlib.md5(dedup_key.encode('utf-8')).hexdigest()
+                    issue_hash = self._build_issue_id(host, url, issue_name)
                     if issue_hash in seen:
                         continue
                     seen.add(issue_hash)
@@ -673,7 +1114,7 @@ Remediation:
                     curl_cmd = self._generate_curl(base_req_info, base_request)
                     python_template = self._generate_python(base_req_info, base_request, cookies)
 
-                    json_data.append({
+                    base_record = {
                         "id": issue_hash,
                         "timestamp": scan_timestamp,
                         "severity": severity,
@@ -699,7 +1140,8 @@ Remediation:
                         },
                         "curl_command": curl_cmd,
                         "python_request_template": python_template
-                    })
+                    }
+                    json_data.append(self._build_export_record(profile, base_record))
                 except Exception as e:
                     self._callbacks.printError("Error: " + str(e))
 
@@ -759,8 +1201,8 @@ Remediation:
                     except Exception as e:
                         self._callbacks.printError("Error closing stats writer: " + str(e))
 
-            readme = "# Burp Export - {}\n\nTotal: {} issues\nHigh: {}\nMedium: {}\nHosts: {}\n\n".format(
-                scan_timestamp, len(json_data), stats["by_severity"].get("High", 0),
+            readme = "# Burp Export - {}\n\nProfile: {}\nTotal: {} issues\nHigh: {}\nMedium: {}\nHosts: {}\n\n".format(
+                scan_timestamp, profile, len(json_data), stats["by_severity"].get("High", 0),
                 stats["by_severity"].get("Medium", 0), len(stats["by_host"]))
             for sev in ["High", "Medium"]:
                 if sev in grouped:
@@ -884,17 +1326,26 @@ Remediation:
         
         return template
     
-    def _get_status_file(self):
+    def _get_data_file(self, filename):
         import os
         paths = []
         if os.name == 'nt':
-            paths.append(os.path.join("C:\\", "burp_exports", "issue_status.json"))
-        paths.append(os.path.join(os.path.expanduser("~"), "burp_exports", "issue_status.json"))
+            paths.append(os.path.join("C:\\", "burp_exports", filename))
+        paths.append(os.path.join(os.path.expanduser("~"), "burp_exports", filename))
         
         for path in paths:
             if File(path).exists():
                 return path
         return paths[-1]
+
+    def _get_status_file(self):
+        return self._get_data_file("issue_status.json")
+
+    def _get_notes_file(self):
+        return self._get_data_file("issue_notes.json")
+
+    def _get_presets_file(self):
+        return self._get_data_file("filter_presets.json")
     
     def _read_file(self, filepath):
         reader = None
@@ -952,6 +1403,44 @@ Remediation:
             return
         status_file = os.path.join(export_dir, "issue_status.json")
         self._write_file(status_file, json.dumps(self.issue_status, indent=2))
+
+    def _load_notes(self):
+        notes_file = self._get_notes_file()
+        content = self._read_file(notes_file)
+        if content:
+            try:
+                return json.loads(content)
+            except Exception as e:
+                self._callbacks.printError("Error loading notes: " + str(e))
+        return {}
+
+    def _save_notes(self):
+        import os
+        export_dir = self._get_export_dir()
+        if not export_dir:
+            return
+        notes_file = os.path.join(export_dir, "issue_notes.json")
+        self._write_file(notes_file, json.dumps(self.issue_notes, indent=2))
+
+    def _load_presets(self):
+        presets_file = self._get_presets_file()
+        content = self._read_file(presets_file)
+        if content:
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                self._callbacks.printError("Error loading presets: " + str(e))
+        return {}
+
+    def _save_presets(self):
+        import os
+        export_dir = self._get_export_dir()
+        if not export_dir:
+            return
+        presets_file = os.path.join(export_dir, "filter_presets.json")
+        self._write_file(presets_file, json.dumps(self.filter_presets, indent=2))
     
     def _get_status_str(self, issue_id):
         status = self.issue_status.get(issue_id, {})
@@ -967,6 +1456,7 @@ Remediation:
             self.tested_cb.setSelected(False)
             self.exploited_cb.setSelected(False)
             self.fp_cb.setSelected(False)
+            self.note_field.setText("")
             return
 
         issue_data = self.issues_cache.get(key)
@@ -976,6 +1466,7 @@ Remediation:
             self.tested_cb.setSelected(status.get("tested", False))
             self.exploited_cb.setSelected(status.get("exploited", False))
             self.fp_cb.setSelected(status.get("fp", False))
+            self.note_field.setText(self.issue_notes.get(issue_id, ""))
     
     def _update_status(self):
         key = self._get_selected_issue_key()

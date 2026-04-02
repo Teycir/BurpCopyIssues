@@ -76,12 +76,17 @@ Interactive UI extension for browsing, copying, and exporting scan findings.
 
 **Features:**
 - Filter by severity (High/Medium) and confidence (Certain/Firm/Tentative)
+- Advanced filtering by host/path/issue-type regex, status, and unique-only mode
+- Saved filter presets (save/apply/delete)
 - Color-coded buttons with brightness gradients
 - Alternating row backgrounds for readability
 - Double-click to copy full issue details to clipboard
+- Multi-select bulk actions (bulk tested/exploited/FP/clear + copy selected)
+- Per-issue analyst notes with persistence
 - Copied issues turn light green until refresh
 - Refresh button to reload current filter
 - Background export with live status and `Cancel Export` support
+- Export profiles: Evidence, Quick, Submission, Dev Ticket
 - Status tracking with checkboxes (Tested/Exploited/False Positive)
 - Duplicate highlighting - unique issues show **[UNIQUE]** in bold green on right
 - Group-by-host headers are non-actionable rows (copy/status actions stay issue-safe)
@@ -89,9 +94,11 @@ Interactive UI extension for browsing, copying, and exporting scan findings.
 
 **Usage:**
 - Click severity/confidence filter → Double-click issue → Copy to clipboard
-- Use checkboxes to mark status (Tested/Exploited/False Positive)
+- Use checkboxes for single-issue status, or use bulk buttons for multi-select updates
+- Save commonly used views with presets (host/path/type regex + status + unique-only + grouping)
+- Add analyst notes per issue with Save Note / Clear Note
 - Click "Refresh" to reload findings
-- Click "Export All" for JSON export with full HTTP evidence (use "Cancel Export" to stop)
+- Choose export profile, then click "Export All" (use "Cancel Export" to stop)
 
 <p align="center">
   <img src="Assets/groupbyhost.png" alt="Group by Host">
@@ -174,9 +181,16 @@ Displays all High and Medium severity issues detected by Burp Scanner, including
   - Copied rows: Light green background
   - Unique issues: Bold green **[UNIQUE]** marker on right
 - **Status Persistence**: Saved to `~/burp_exports/issue_status.json` (or `C:\burp_exports\` on Windows)
+- **Notes Persistence**: Saved to `~/burp_exports/issue_notes.json` (or `C:\burp_exports\` on Windows)
+- **Preset Persistence**: Saved to `~/burp_exports/filter_presets.json` (or `C:\burp_exports\` on Windows)
 - **Cross-platform**: Works on Windows, Linux, and macOS
 - **Count Refresh**: Background count refresh every 15s + scanner-listener cache invalidation
 - **Performance**: Async issue loading/export, prompt generation on-demand, and export limited to first 2 HTTP messages per issue with 20 headers max
+- **Export Profiles**:
+  - `Evidence`: full technical evidence payload
+  - `Quick`: lightweight triage payload
+  - `Submission`: sanitized report-oriented payload
+  - `Dev Ticket`: developer handoff payload with repro details
 
 
 ## Author

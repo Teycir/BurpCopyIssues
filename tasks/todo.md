@@ -16,6 +16,14 @@
 - [x] Update docs/changelog to match behavior
 - [x] Run syntax verification and summarize results
 
+## Features 1-5 (Requested)
+
+- [x] Feature 1: Bulk actions for selected issues
+- [x] Feature 2: Saved filter presets
+- [x] Feature 3: Advanced filtering (host/path/type regex + status + unique-only)
+- [x] Feature 4: Per-issue notes with persistence
+- [x] Feature 5: Export profiles (Evidence/Quick/Submission/Dev Ticket)
+
 ## Review
 
 - Root cause: `Timer(3000)` executed `_update_button_counts()` on Swing EDT, and that method called `callbacks.getScanIssues(None)` directly, which blocks Burp UI under heavy traffic/issue volume.
@@ -28,3 +36,5 @@
 - Improvement pass: scanner events now invalidate issue cache and trigger throttled count refresh.
 - Improvement pass: list rendering now uses row metadata (header vs issue) to keep copy/status/unique marker behavior correct in grouped view.
 - Improvement pass verification: `python3 -m py_compile CopyIssues.py` passed after changes.
+
+- Features 1-5 pass: added multi-select bulk status/copy workflow, advanced filter controls, preset save/apply/delete, persistent analyst notes, and profile-based export shaping.
