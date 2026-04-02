@@ -1,18 +1,21 @@
 # pylint: disable=import-error
-from burp import IBurpExtender, ITab
-from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer
+from burp import IBurpExtender, ITab, IExtensionStateListener
+from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer, SwingUtilities
 from java.awt import BorderLayout, GridLayout, Toolkit, Color, Font, FlowLayout, Component
 from javax.swing.event import DocumentListener
 from java.awt.datatransfer import StringSelection
 from java.awt.event import MouseAdapter, ActionListener
 from java.io import File, FileWriter, FileReader, BufferedReader
+from java.lang import Runnable
 from java.text import SimpleDateFormat
 from java.util import Date
 import hashlib
 import json
 import re
+import threading
+import time
 
-class BurpExtender(IBurpExtender, ITab):
+class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
@@ -30,6 +33,15 @@ class BurpExtender(IBurpExtender, ITab):
         self.issue_list.addMouseListener(DoubleClickListener(self))
         self.current_filter = {"severity": None, "confidence": None}
         self.filter_buttons = {}
+        self._cache_lock = threading.RLock()
+        self._cache_ttl_seconds = 5
+        self._issue_cache_timestamp = 0
+        self._issues_by_filter = {}
+        self._count_cache = {}
+        self._last_rendered_counts = {}
+        self._count_refresh_running = False
+        self._count_refresh_pending = False
+        self._load_request_id = 0
         
         self._panel = JPanel(BorderLayout())
         self._panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
@@ -128,13 +140,16 @@ class BurpExtender(IBurpExtender, ITab):
         
         self._panel.add(btn_panel, BorderLayout.NORTH)
         callbacks.addSuiteTab(self)
+        callbacks.registerExtensionStateListener(self)
         
-        # Update button counts after tab is added
-        self._update_button_counts()
+        # Start with zeroed counters and refresh asynchronously.
+        self._apply_button_counts({})
         
-        # Start timer to auto-refresh counts every 3 seconds
-        self.timer = Timer(3000, UpdateCountsListener(self))
+        # Refresh counters periodically without blocking the UI thread.
+        self.timer = Timer(15000, UpdateCountsListener(self))
+        self.timer.setInitialDelay(5000)
         self.timer.start()
+        self._request_count_refresh(force=True)
 
     def getTabCaption(self):
         count = self.list_model.getSize()
@@ -142,102 +157,236 @@ class BurpExtender(IBurpExtender, ITab):
     
     def getUiComponent(self):
         return self._panel
+
+    def extensionUnloaded(self):
+        if hasattr(self, "timer") and self.timer:
+            self.timer.stop()
     
     def refresh_current(self):
-        self._update_button_counts()
+        self._request_count_refresh(force=True)
         if self.current_filter["severity"] and self.current_filter["confidence"]:
             self.copied_indices.clear()
             self.load_issues(self.current_filter["severity"], self.current_filter["confidence"])
         else:
             JOptionPane.showMessageDialog(self._panel, "Counts refreshed! Click a filter to view issues.", "Refreshed", JOptionPane.INFORMATION_MESSAGE)
-    
-    def _update_button_counts(self):
-        all_issues = self._callbacks.getScanIssues(None)
+
+    def _run_on_ui(self, fn):
+        SwingUtilities.invokeLater(UiRunnable(fn))
+
+    def _build_issue_groups(self, all_issues):
+        grouped = {}
         counts = {}
         for issue in all_issues:
             sev = issue.getSeverity()
             conf = issue.getConfidence()
-            if sev in ["High", "Medium"]:
-                key = (sev, conf)
-                counts[key] = counts.get(key, 0) + 1
-        
+            if sev not in ["High", "Medium"]:
+                continue
+
+            key = (sev, conf)
+            counts[key] = counts.get(key, 0) + 1
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(issue)
+
+        return grouped, counts
+
+    def _refresh_issue_cache(self, force=False):
+        now = time.time()
+        with self._cache_lock:
+            cache_is_fresh = self._issues_by_filter and (now - self._issue_cache_timestamp) < self._cache_ttl_seconds
+            if cache_is_fresh and not force:
+                return self._issues_by_filter, self._count_cache
+
+        all_issues = self._callbacks.getScanIssues(None) or []
+        grouped, counts = self._build_issue_groups(all_issues)
+
+        with self._cache_lock:
+            self._issues_by_filter = grouped
+            self._count_cache = counts
+            self._issue_cache_timestamp = time.time()
+            return self._issues_by_filter, self._count_cache
+
+    def _request_count_refresh(self, force=False):
+        with self._cache_lock:
+            now = time.time()
+            cache_is_fresh = self._issues_by_filter and (now - self._issue_cache_timestamp) < self._cache_ttl_seconds
+            if cache_is_fresh and not force:
+                counts_snapshot = dict(self._count_cache)
+                self._run_on_ui(lambda: self._apply_button_counts(counts_snapshot))
+                return
+
+            if self._count_refresh_running:
+                self._count_refresh_pending = True
+                return
+
+            self._count_refresh_running = True
+
+        worker = threading.Thread(target=self._count_refresh_worker, args=(force,))
+        worker.setDaemon(True)
+        worker.start()
+
+    def _count_refresh_worker(self, force):
+        try:
+            _, counts = self._refresh_issue_cache(force=force)
+            counts_snapshot = dict(counts)
+            self._run_on_ui(lambda: self._apply_button_counts(counts_snapshot))
+        except Exception as e:
+            self._callbacks.printError("Error refreshing issue counts: " + str(e))
+        finally:
+            with self._cache_lock:
+                pending = self._count_refresh_pending
+                self._count_refresh_pending = False
+                self._count_refresh_running = False
+
+            if pending:
+                self._request_count_refresh(force=True)
+
+    def _apply_button_counts(self, counts):
+        if counts == self._last_rendered_counts:
+            return
+
         for key, btn in self.filter_buttons.items():
             count = counts.get(key, 0)
             text = "{} - {} ({})".format(key[0], key[1], count)
             btn.setText(text)
-    
+
+        self._last_rendered_counts = dict(counts)
+
+    def _update_button_counts(self):
+        self._request_count_refresh(force=False)
+
     def load_issues(self, severity, confidence):
-        self._update_button_counts()
         self.current_filter = {"severity": severity, "confidence": confidence}
         self.copied_indices.clear()
-        self.duplicate_indices.clear()
-        issues = [i for i in self._callbacks.getScanIssues(None)
-                  if i.getSeverity() == severity and i.getConfidence() == confidence]
-        
         self.all_issues_data = []
+        self.issues_cache = {}
+        self.duplicate_indices = set()
+        self.issue_list.clearSelection()
         self.list_model.clear()
-        self.issues_cache.clear()
-        
-        if not issues:
-            self._callbacks.printOutput("[!] No {} {} issues found".format(severity, confidence))
-            return
-        
-        # Count duplicates per host
-        dup_counts = {}
-        for issue in issues:
-            http_messages = issue.getHttpMessages()
-            if http_messages:
-                service = http_messages[0].getHttpService()
-                host = service.getHost()
-                issue_name = issue.getIssueName()
-                key = "{}:{}".format(host, issue_name)
-                dup_counts[key] = dup_counts.get(key, 0) + 1
-        
-        for idx, issue in enumerate(issues):
-            try:
+        self.list_model.addElement("Loading {} {} issues...".format(severity, confidence))
+        self._callbacks.setExtensionName("CopyIssues (loading...)")
+
+        with self._cache_lock:
+            self._load_request_id += 1
+            load_request_id = self._load_request_id
+
+        self._request_count_refresh(force=False)
+        worker = threading.Thread(target=self._load_issues_worker, args=(severity, confidence, load_request_id))
+        worker.setDaemon(True)
+        worker.start()
+
+    def _load_issues_worker(self, severity, confidence, load_request_id):
+        try:
+            issues_by_filter, _ = self._refresh_issue_cache(force=False)
+            issues = list(issues_by_filter.get((severity, confidence), []))
+
+            # If the selected bucket is empty, force one refresh to avoid stale cache misses.
+            if not issues:
+                issues_by_filter, _ = self._refresh_issue_cache(force=True)
+                issues = list(issues_by_filter.get((severity, confidence), []))
+
+            dup_counts = {}
+            for issue in issues:
                 http_messages = issue.getHttpMessages()
-                service = http_messages[0].getHttpService() if http_messages else None
-                host = service.getHost() if service else ""
-                issue_name = issue.getIssueName()
-                issue_id = hashlib.md5("{}{}{}".format(host, str(issue.getUrl()), issue_name).encode('utf-8')).hexdigest()
-                
-                dup_key = "{}:{}".format(host, issue_name)
-                count = dup_counts.get(dup_key, 1)
-                if count > 1:
-                    self.duplicate_indices.add(idx)
-                
-                key = "[{}] {} - {}".format(idx + 1, issue_name, str(issue.getUrl()))
-                self.list_model.addElement(key)
-                self.issues_cache[key] = {"prompt": None, "id": issue_id}
-                
-                http_data = ""
+                if http_messages:
+                    service = http_messages[0].getHttpService()
+                    host = service.getHost() if service else ""
+                    issue_name = issue.getIssueName()
+                    dup_key = "{}:{}".format(host, issue_name)
+                    dup_counts[dup_key] = dup_counts.get(dup_key, 0) + 1
+
+            rows = []
+            cache = {}
+            duplicate_indices = set()
+            for idx, issue in enumerate(issues):
                 try:
                     http_messages = issue.getHttpMessages()
-                    if http_messages and len(http_messages) > 0:
-                        req = self._helpers.bytesToString(http_messages[0].getRequest())
-                        lines = req.split('\r\n')
-                        method_line = lines[0] if lines else ""
-                        headers = '\r\n'.join([h for h in lines[1:] if ':' in h][:15])
-                        
-                        body = ""
-                        if '\r\n\r\n' in req:
-                            body_content = req.split('\r\n\r\n', 1)[1][:500]
-                            if body_content.strip():
-                                body = "\nBody: {}\n".format(body_content)
-                        
-                        http_data = "\n=== HTTP REQUEST ===\n{}\n{}{}\n".format(method_line, headers, body)
+                    service = http_messages[0].getHttpService() if http_messages else None
+                    host = service.getHost() if service else ""
+                    issue_name = issue.getIssueName()
+                    issue_url = str(issue.getUrl())
+                    issue_id = hashlib.md5("{}{}{}".format(host, issue_url, issue_name).encode('utf-8')).hexdigest()
+
+                    dup_key = "{}:{}".format(host, issue_name)
+                    if dup_counts.get(dup_key, 1) > 1:
+                        duplicate_indices.add(idx)
+
+                    key = "[{}] {} - {}".format(idx + 1, issue_name, issue_url)
+                    cache[key] = {"prompt": None, "id": issue_id, "issue": issue}
+                    rows.append({"key": key, "host": host, "issue_name": issue_name, "url": issue_url})
                 except Exception as e:
-                    self._callbacks.printError("Error extracting HTTP data: " + str(e))
-                
-                references = ""
-                try:
-                    refs = issue.getReferences()
-                    if refs:
-                        references = "\n\nReferences:\n" + '\n'.join(['- ' + str(r) for r in refs[:3]])
-                except Exception as e:
-                    self._callbacks.printError("Error extracting references: " + str(e))
-                
-                prompt = """=== BURP SCAN FINDING ===
+                    self._callbacks.printError("Error processing issue: " + str(e))
+
+            def apply_results():
+                with self._cache_lock:
+                    if load_request_id != self._load_request_id:
+                        return
+
+                self.all_issues_data = rows
+                self.issues_cache = cache
+                self.duplicate_indices = duplicate_indices
+                self.list_model.clear()
+
+                if not rows:
+                    self._callbacks.printOutput("[!] No {} {} issues found".format(severity, confidence))
+                else:
+                    for item in rows:
+                        self.list_model.addElement(item["key"])
+                    self._callbacks.printOutput("[+] Loaded {} {} {} issues".format(len(rows), severity, confidence))
+
+                self._callbacks.setExtensionName("CopyIssues ({})".format(len(rows)))
+
+            self._run_on_ui(apply_results)
+        except Exception as e:
+            error_msg = str(e)
+            self._callbacks.printError("Error loading issues: " + error_msg)
+
+            def apply_error():
+                with self._cache_lock:
+                    if load_request_id != self._load_request_id:
+                        return
+
+                self.all_issues_data = []
+                self.issues_cache = {}
+                self.duplicate_indices = set()
+                self.list_model.clear()
+                self.list_model.addElement("Failed to load issues. Check Extender output.")
+                self._callbacks.setExtensionName("CopyIssues")
+
+            self._run_on_ui(apply_error)
+
+    def _build_issue_prompt(self, issue):
+        if not issue:
+            return None
+
+        http_data = ""
+        try:
+            http_messages = issue.getHttpMessages()
+            if http_messages and len(http_messages) > 0:
+                req = self._helpers.bytesToString(http_messages[0].getRequest())
+                lines = req.split('\r\n')
+                method_line = lines[0] if lines else ""
+                headers = '\r\n'.join([h for h in lines[1:] if ':' in h][:15])
+
+                body = ""
+                if '\r\n\r\n' in req:
+                    body_content = req.split('\r\n\r\n', 1)[1][:500]
+                    if body_content.strip():
+                        body = "\nBody: {}\n".format(body_content)
+
+                http_data = "\n=== HTTP REQUEST ===\n{}\n{}{}\n".format(method_line, headers, body)
+        except Exception as e:
+            self._callbacks.printError("Error extracting HTTP data: " + str(e))
+
+        references = ""
+        try:
+            refs = issue.getReferences()
+            if refs:
+                references = "\n\nReferences:\n" + '\n'.join(['- ' + str(r) for r in refs[:3]])
+        except Exception as e:
+            self._callbacks.printError("Error extracting references: " + str(e))
+
+        return """=== BURP SCAN FINDING ===
 Severity: {} (Confidence: {})
 Issue: {}
 URL: {}
@@ -254,14 +403,6 @@ Remediation:
            str(issue.getUrl()), issue.getIssueDetail() or "No details",
            issue.getIssueBackground() or "N/A",
            issue.getRemediationDetail() or "N/A", references, http_data)
-                
-                self.issues_cache[key]["prompt"] = prompt
-                self.all_issues_data.append({"key": key, "host": host, "issue_name": issue_name, "url": str(issue.getUrl())})
-            except Exception as e:
-                self._callbacks.printError("Error processing issue: " + str(e))
-        
-        self._callbacks.printOutput("[+] Loaded {} {} {} issues".format(len(issues), severity, confidence))
-        self._callbacks.setExtensionName("CopyIssues ({})".format(len(issues)))
     
     def _apply_filters(self):
         search_text = self.search_field.getText().lower()
@@ -719,6 +860,13 @@ Remediation:
                 self.exploited_cb.setSelected(False)
                 self.fp_cb.setSelected(False)
 
+class UiRunnable(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self):
+        self.fn()
+
 class AlternatingRowRenderer(ListCellRenderer):
     def __init__(self, extender):
         self.extender = extender
@@ -764,9 +912,17 @@ class DoubleClickListener(MouseAdapter):
             if idx >= 0:
                 key = self.extender.list_model.getElementAt(idx)
                 issue_data = self.extender.issues_cache.get(key)
-                if issue_data and issue_data.get("prompt"):
+                if issue_data:
                     try:
-                        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(issue_data["prompt"]), None)
+                        prompt = issue_data.get("prompt")
+                        if not prompt:
+                            prompt = self.extender._build_issue_prompt(issue_data.get("issue"))
+                            issue_data["prompt"] = prompt
+
+                        if not prompt:
+                            raise ValueError("No prompt data available")
+
+                        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(prompt), None)
                         self.extender.copied_indices.add(idx)
                         self.extender.issue_list.repaint()
                         JOptionPane.showMessageDialog(self.extender._panel, "Copied to clipboard!", "Success", JOptionPane.INFORMATION_MESSAGE)

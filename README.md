@@ -177,6 +177,13 @@ Displays all High and Medium severity issues detected by Burp Scanner, including
 
 ## Changelog
 
+### v1.1.0 (2025)
+- Auto-refresh button counts every 3 seconds
+- Refresh button now updates all vulnerability counts
+- Enhanced exception handling with detailed error logging
+- All exceptions now print to Burp debugger for easier troubleshooting
+- Fixed SonarQube code quality warnings
+
 ### v1.0.0 (2024)
 - Initial release
 - Filter by severity (High/Medium) and confidence (Certain/Firm/Tentative)
