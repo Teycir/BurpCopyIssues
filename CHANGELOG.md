@@ -5,7 +5,7 @@ All notable changes to BurpCopyIssues will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2025-01-XX
+## [1.1.0] - 2026-04-02
 
 ### Added
 - Auto-refresh timer that updates button counts every 3 seconds
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Button counts now update automatically without requiring Burp reload
 - All exceptions now properly logged to Burp console/debugger
 
-## [1.0.0] - 2024
+## [1.0.0] - 2025
 
 ### Added
 - Initial release

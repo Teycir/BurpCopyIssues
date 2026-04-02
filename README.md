@@ -175,28 +175,6 @@ Displays all High and Medium severity issues detected by Burp Scanner, including
 - **Cross-platform**: Works on Windows, Linux, and macOS
 - **Performance**: Limited to first 2 HTTP messages per issue, 20 headers max
 
-## Changelog
-
-### v1.1.0 (2025)
-- Auto-refresh button counts every 3 seconds
-- Refresh button now updates all vulnerability counts
-- Enhanced exception handling with detailed error logging
-- All exceptions now print to Burp debugger for easier troubleshooting
-- Fixed SonarQube code quality warnings
-
-### v1.0.0 (2024)
-- Initial release
-- Filter by severity (High/Medium) and confidence (Certain/Firm/Tentative)
-- Double-click to copy issue details to clipboard
-- Color-coded UI with alternating row backgrounds
-- Status tracking (Tested/Exploited/False Positive)
-- Duplicate detection with [UNIQUE] markers
-- JSON export with full HTTP evidence
-- curl commands and Python request templates
-- Search and sort functionality
-- Group by host feature
-- Cross-platform support (Windows/Linux/macOS)
-- Status persistence across Burp restarts
 
 ## Author
 
