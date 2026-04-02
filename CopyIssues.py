@@ -1,5 +1,5 @@
 # pylint: disable=import-error
-from burp import IBurpExtender, ITab, IExtensionStateListener
+from burp import IBurpExtender, ITab, IExtensionStateListener, IScannerListener
 from javax.swing import JPanel, JButton, JList, JScrollPane, DefaultListModel, JOptionPane, BorderFactory, ListCellRenderer, JLabel, JCheckBox, BoxLayout, Box, JTextField, JComboBox, Timer, SwingUtilities
 from java.awt import BorderLayout, GridLayout, Toolkit, Color, Font, FlowLayout, Component
 from javax.swing.event import DocumentListener
@@ -15,17 +15,20 @@ import re
 import threading
 import time
 
-class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
+class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IScannerListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
         callbacks.setExtensionName("CopyIssues")
+        self._scanner_listener_registered = False
         
         self.issues_cache = {}
         self.all_issues_data = []
         self.issue_status = self._load_status()
-        self.copied_indices = set()
-        self.duplicate_indices = set()
+        self.copied_issue_keys = set()
+        self.duplicate_issue_keys = set()
+        self.displayed_rows = []
+        self.group_by_host = False
         self.list_model = DefaultListModel()
         self.issue_list = JList(self.list_model)
         self.issue_list.setFont(Font("Monospaced", Font.PLAIN, 12))
@@ -42,6 +45,11 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
         self._count_refresh_running = False
         self._count_refresh_pending = False
         self._load_request_id = 0
+        self._last_scanner_refresh_request = 0
+        self._scanner_refresh_min_interval = 2
+        self._export_lock = threading.RLock()
+        self._export_running = False
+        self._export_cancel_requested = False
         
         self._panel = JPanel(BorderLayout())
         self._panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
@@ -119,10 +127,16 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
         med_tentative.addActionListener(lambda e: self.load_issues("Medium", "Tentative"))
         self.filter_buttons[("Medium", "Tentative")] = med_tentative
         
-        export_btn = JButton("Export All")
-        export_btn.setBackground(Color(40, 167, 69))
-        export_btn.setForeground(Color.WHITE)
-        export_btn.addActionListener(lambda e: self.export_all())
+        self.export_btn = JButton("Export All")
+        self.export_btn.setBackground(Color(40, 167, 69))
+        self.export_btn.setForeground(Color.WHITE)
+        self.export_btn.addActionListener(lambda e: self.export_all())
+
+        self.cancel_export_btn = JButton("Cancel Export")
+        self.cancel_export_btn.setBackground(Color(220, 53, 69))
+        self.cancel_export_btn.setForeground(Color.WHITE)
+        self.cancel_export_btn.setEnabled(False)
+        self.cancel_export_btn.addActionListener(lambda e: self._cancel_export())
         
         refresh_btn = JButton("Refresh")
         refresh_btn.setBackground(Color(108, 117, 125))
@@ -135,12 +149,22 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
         btn_panel.add(med_certain)
         btn_panel.add(med_firm)
         btn_panel.add(med_tentative)
-        btn_panel.add(export_btn)
+        btn_panel.add(self.export_btn)
         btn_panel.add(refresh_btn)
+        btn_panel.add(self.cancel_export_btn)
+
+        self.export_status_label = JLabel("")
+        self.export_status_label.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._panel.add(self.export_status_label, BorderLayout.SOUTH)
         
         self._panel.add(btn_panel, BorderLayout.NORTH)
         callbacks.addSuiteTab(self)
         callbacks.registerExtensionStateListener(self)
+        try:
+            callbacks.registerScannerListener(self)
+            self._scanner_listener_registered = True
+        except Exception as e:
+            self._callbacks.printError("Scanner listener registration failed: " + str(e))
         
         # Start with zeroed counters and refresh asynchronously.
         self._apply_button_counts({})
@@ -161,11 +185,35 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
     def extensionUnloaded(self):
         if hasattr(self, "timer") and self.timer:
             self.timer.stop()
+        if self._scanner_listener_registered:
+            try:
+                self._callbacks.removeScannerListener(self)
+            except Exception as e:
+                self._callbacks.printError("Scanner listener cleanup failed: " + str(e))
+        self._cancel_export()
+
+    def newScanIssue(self, issue):
+        self._invalidate_issue_cache()
+        now = time.time()
+        should_refresh = False
+        with self._cache_lock:
+            if now - self._last_scanner_refresh_request >= self._scanner_refresh_min_interval:
+                self._last_scanner_refresh_request = now
+                should_refresh = True
+
+        if should_refresh:
+            self._request_count_refresh(force=True)
+
+    def _invalidate_issue_cache(self):
+        with self._cache_lock:
+            self._issue_cache_timestamp = 0
+            self._issues_by_filter = {}
+            self._count_cache = {}
     
     def refresh_current(self):
         self._request_count_refresh(force=True)
         if self.current_filter["severity"] and self.current_filter["confidence"]:
-            self.copied_indices.clear()
+            self.copied_issue_keys.clear()
             self.load_issues(self.current_filter["severity"], self.current_filter["confidence"])
         else:
             JOptionPane.showMessageDialog(self._panel, "Counts refreshed! Click a filter to view issues.", "Refreshed", JOptionPane.INFORMATION_MESSAGE)
@@ -257,10 +305,11 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
 
     def load_issues(self, severity, confidence):
         self.current_filter = {"severity": severity, "confidence": confidence}
-        self.copied_indices.clear()
+        self.copied_issue_keys.clear()
         self.all_issues_data = []
         self.issues_cache = {}
-        self.duplicate_indices = set()
+        self.duplicate_issue_keys = set()
+        self.displayed_rows = []
         self.issue_list.clearSelection()
         self.list_model.clear()
         self.list_model.addElement("Loading {} {} issues...".format(severity, confidence))
@@ -297,7 +346,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
 
             rows = []
             cache = {}
-            duplicate_indices = set()
+            duplicate_issue_keys = set()
             for idx, issue in enumerate(issues):
                 try:
                     http_messages = issue.getHttpMessages()
@@ -307,11 +356,11 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
                     issue_url = str(issue.getUrl())
                     issue_id = hashlib.md5("{}{}{}".format(host, issue_url, issue_name).encode('utf-8')).hexdigest()
 
+                    key = "[{}] {} - {}".format(idx + 1, issue_name, issue_url)
                     dup_key = "{}:{}".format(host, issue_name)
                     if dup_counts.get(dup_key, 1) > 1:
-                        duplicate_indices.add(idx)
+                        duplicate_issue_keys.add(key)
 
-                    key = "[{}] {} - {}".format(idx + 1, issue_name, issue_url)
                     cache[key] = {"prompt": None, "id": issue_id, "issue": issue}
                     rows.append({"key": key, "host": host, "issue_name": issue_name, "url": issue_url})
                 except Exception as e:
@@ -324,14 +373,14 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
 
                 self.all_issues_data = rows
                 self.issues_cache = cache
-                self.duplicate_indices = duplicate_indices
-                self.list_model.clear()
+                self.duplicate_issue_keys = duplicate_issue_keys
 
                 if not rows:
+                    self.displayed_rows = []
+                    self.list_model.clear()
                     self._callbacks.printOutput("[!] No {} {} issues found".format(severity, confidence))
                 else:
-                    for item in rows:
-                        self.list_model.addElement(item["key"])
+                    self._refresh_list_view()
                     self._callbacks.printOutput("[+] Loaded {} {} {} issues".format(len(rows), severity, confidence))
 
                 self._callbacks.setExtensionName("CopyIssues ({})".format(len(rows)))
@@ -348,7 +397,8 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
 
                 self.all_issues_data = []
                 self.issues_cache = {}
-                self.duplicate_indices = set()
+                self.duplicate_issue_keys = set()
+                self.displayed_rows = []
                 self.list_model.clear()
                 self.list_model.addElement("Failed to load issues. Check Extender output.")
                 self._callbacks.setExtensionName("CopyIssues")
@@ -405,42 +455,72 @@ Remediation:
            issue.getRemediationDetail() or "N/A", references, http_data)
     
     def _apply_filters(self):
+        self._refresh_list_view()
+
+    def _set_display_rows(self, rows):
+        self.displayed_rows = rows
+        self.list_model.clear()
+        for row in rows:
+            self.list_model.addElement(row["text"])
+
+    def _refresh_list_view(self):
         search_text = self.search_field.getText().lower()
         sort_by = self.sort_combo.getSelectedItem()
-        
+
         filtered = [d for d in self.all_issues_data if search_text in d["key"].lower()]
-        
+
         if sort_by == "Host":
             filtered.sort(key=lambda x: x["host"])
         elif sort_by == "Issue Type":
             filtered.sort(key=lambda x: x["issue_name"])
         elif sort_by == "URL":
             filtered.sort(key=lambda x: x["url"])
-        
-        self.list_model.clear()
-        for d in filtered:
-            self.list_model.addElement(d["key"])
-        
+
+        rows = []
+        if self.group_by_host:
+            grouped = {}
+            for d in filtered:
+                host = d["host"] or "<no-host>"
+                if host not in grouped:
+                    grouped[host] = []
+                grouped[host].append(d)
+
+            for host in sorted(grouped.keys()):
+                rows.append({
+                    "type": "header",
+                    "text": "=== {} ({}) ===".format(host, len(grouped[host])),
+                    "issue_key": None
+                })
+                for item in grouped[host]:
+                    rows.append({
+                        "type": "issue",
+                        "text": "  " + item["key"],
+                        "issue_key": item["key"]
+                    })
+        else:
+            for item in filtered:
+                rows.append({
+                    "type": "issue",
+                    "text": item["key"],
+                    "issue_key": item["key"]
+                })
+
+        self._set_display_rows(rows)
         self._callbacks.setExtensionName("CopyIssues ({})".format(len(filtered)))
+
+    def _get_selected_issue_key(self):
+        idx = self.issue_list.getSelectedIndex()
+        if idx < 0 or idx >= len(self.displayed_rows):
+            return None
+        row = self.displayed_rows[idx]
+        if row.get("type") != "issue":
+            return None
+        return row.get("issue_key")
     
     def _toggle_grouping(self):
-        if not self.all_issues_data:
-            return
-        
-        grouped = {}
-        for d in self.all_issues_data:
-            host = d["host"]
-            if host not in grouped:
-                grouped[host] = []
-            grouped[host].append(d["key"])
-        
-        self.list_model.clear()
-        for host in sorted(grouped.keys()):
-            self.list_model.addElement("=== {} ({}) ===".format(host, len(grouped[host])))
-            for key in grouped[host]:
-                self.list_model.addElement("  " + key)
-        
-        self._callbacks.setExtensionName("CopyIssues ({})".format(len(self.all_issues_data)))
+        self.group_by_host = not self.group_by_host
+        self.group_btn.setText("Ungroup" if self.group_by_host else "Group by Host")
+        self._refresh_list_view()
     
     def _get_export_dir(self, subdir=""):
         import os
@@ -460,240 +540,301 @@ Remediation:
         return None
     
     def export_all(self):
+        with self._export_lock:
+            if self._export_running:
+                JOptionPane.showMessageDialog(self._panel, "Export already in progress.", "Info", JOptionPane.INFORMATION_MESSAGE)
+                return
+            self._export_running = True
+            self._export_cancel_requested = False
+
+        self._set_export_ui_state(True)
+        self._set_export_status("Exporting issues...")
+        worker = threading.Thread(target=self._export_all_worker)
+        worker.setDaemon(True)
+        worker.start()
+
+    def _set_export_ui_state(self, running):
+        self.export_btn.setEnabled(not running)
+        self.cancel_export_btn.setEnabled(running)
+
+    def _set_export_status(self, message):
+        self.export_status_label.setText(message or "")
+
+    def _cancel_export(self):
+        with self._export_lock:
+            if not self._export_running:
+                return
+            self._export_cancel_requested = True
+        self._run_on_ui(lambda: self._set_export_status("Cancelling export..."))
+
+    def _is_export_cancelled(self):
+        with self._export_lock:
+            return self._export_cancel_requested
+
+    def _finish_export(self):
+        with self._export_lock:
+            self._export_running = False
+            self._export_cancel_requested = False
+        self._run_on_ui(lambda: self._set_export_ui_state(False))
+
+    def _export_all_worker(self):
+        import os
         scan_timestamp = SimpleDateFormat("yyyyMMdd_HHmmss").format(Date())
         base_dir = self._get_export_dir("scan_{}".format(scan_timestamp))
-        
         if not base_dir:
-            JOptionPane.showMessageDialog(self._panel, "Cannot create export directory", "Error", JOptionPane.ERROR_MESSAGE)
+            self._run_on_ui(lambda: JOptionPane.showMessageDialog(self._panel, "Cannot create export directory", "Error", JOptionPane.ERROR_MESSAGE))
+            self._finish_export()
+            self._run_on_ui(lambda: self._set_export_status("Export failed"))
             return
-        
-        all_issues = self._callbacks.getScanIssues(None)
-        seen = set()
-        json_data = []
-        
-        for issue in all_issues:
-            try:
-                severity = issue.getSeverity()
-                if severity not in ["High", "Medium"]:
-                    continue
-                
-                http_messages = issue.getHttpMessages()
-                if not http_messages:
-                    continue
-                
-                service = http_messages[0].getHttpService()
-                url = str(self._helpers.analyzeRequest(http_messages[0]).getUrl())
-                host = service.getHost()
-                issue_name = issue.getIssueName()
-                confidence = issue.getConfidence()
-                
-                dedup_key = "{}{}{}".format(host, url, issue_name)
-                issue_hash = hashlib.md5(dedup_key.encode('utf-8')).hexdigest()
-                if issue_hash in seen:
-                    continue
-                seen.add(issue_hash)
-                
-                base_request = http_messages[0]
-                base_req_info = self._helpers.analyzeRequest(base_request)
-                
-                # Extract insertion points
-                insertion_points = []
-                for msg in http_messages:
-                    req_info = self._helpers.analyzeRequest(msg)
-                    params = req_info.getParameters()
-                    for param in params:
-                        param_type = ["URL", "Body", "Cookie"][param.getType()] if param.getType() < 3 else "Unknown"
-                        point = "{}: {}".format(param_type, param.getName())
-                        if point not in insertion_points:
-                            insertion_points.append(point)
-                
-                # Extract HTTP evidence (limit to first 2 messages for performance)
-                http_evidence = []
-                for msg in http_messages[:2]:
-                    req_info = self._helpers.analyzeRequest(msg)
-                    req_bytes = msg.getRequest()
-                    req_body_offset = req_info.getBodyOffset()
-                    
-                    req_body = self._helpers.bytesToString(req_bytes[req_body_offset:req_body_offset+5000]) if len(req_bytes) > req_body_offset else ""
-                    
-                    resp_body = ""
-                    status_code = None
-                    if msg.getResponse():
-                        resp_info = self._helpers.analyzeResponse(msg.getResponse())
-                        resp_bytes = msg.getResponse()
-                        resp_body_offset = resp_info.getBodyOffset()
-                        resp_body = self._helpers.bytesToString(resp_bytes[resp_body_offset:resp_body_offset+5000]) if len(resp_bytes) > resp_body_offset else ""
-                        status_code = resp_info.getStatusCode()
-                    
-                    http_evidence.append({
-                        "method": req_info.getMethod(),
-                        "path": req_info.getUrl().getPath(),
-                        "request_body": req_body,
-                        "response_body": resp_body,
-                        "status_code": status_code
+
+        try:
+            all_issues = self._callbacks.getScanIssues(None) or []
+            total_input = len(all_issues)
+            seen = set()
+            json_data = []
+
+            for idx, issue in enumerate(all_issues):
+                if self._is_export_cancelled():
+                    self._callbacks.printOutput("[!] Export cancelled by user")
+                    self._run_on_ui(lambda: JOptionPane.showMessageDialog(self._panel, "Export cancelled.", "Cancelled", JOptionPane.INFORMATION_MESSAGE))
+                    self._run_on_ui(lambda: self._set_export_status("Export cancelled"))
+                    return
+
+                if idx == 0 or idx % 25 == 0:
+                    progress_text = "Exporting issues... {}/{}".format(idx + 1, total_input)
+                    self._run_on_ui(lambda msg=progress_text: self._set_export_status(msg))
+
+                try:
+                    severity = issue.getSeverity()
+                    if severity not in ["High", "Medium"]:
+                        continue
+
+                    http_messages = issue.getHttpMessages()
+                    if not http_messages:
+                        continue
+
+                    service = http_messages[0].getHttpService()
+                    url = str(self._helpers.analyzeRequest(http_messages[0]).getUrl())
+                    host = service.getHost()
+                    issue_name = issue.getIssueName()
+                    confidence = issue.getConfidence()
+
+                    dedup_key = "{}{}{}".format(host, url, issue_name)
+                    issue_hash = hashlib.md5(dedup_key.encode('utf-8')).hexdigest()
+                    if issue_hash in seen:
+                        continue
+                    seen.add(issue_hash)
+
+                    base_request = http_messages[0]
+                    base_req_info = self._helpers.analyzeRequest(base_request)
+
+                    insertion_points = []
+                    for msg in http_messages:
+                        req_info = self._helpers.analyzeRequest(msg)
+                        params = req_info.getParameters()
+                        for param in params:
+                            param_type = ["URL", "Body", "Cookie"][param.getType()] if param.getType() < 3 else "Unknown"
+                            point = "{}: {}".format(param_type, param.getName())
+                            if point not in insertion_points:
+                                insertion_points.append(point)
+
+                    http_evidence = []
+                    for msg in http_messages[:2]:
+                        req_info = self._helpers.analyzeRequest(msg)
+                        req_bytes = msg.getRequest()
+                        req_body_offset = req_info.getBodyOffset()
+                        req_body = self._helpers.bytesToString(req_bytes[req_body_offset:req_body_offset+5000]) if len(req_bytes) > req_body_offset else ""
+
+                        resp_body = ""
+                        status_code = None
+                        if msg.getResponse():
+                            resp_info = self._helpers.analyzeResponse(msg.getResponse())
+                            resp_bytes = msg.getResponse()
+                            resp_body_offset = resp_info.getBodyOffset()
+                            resp_body = self._helpers.bytesToString(resp_bytes[resp_body_offset:resp_body_offset+5000]) if len(resp_bytes) > resp_body_offset else ""
+                            status_code = resp_info.getStatusCode()
+
+                        http_evidence.append({
+                            "method": req_info.getMethod(),
+                            "path": req_info.getUrl().getPath(),
+                            "request_body": req_body,
+                            "response_body": resp_body,
+                            "status_code": status_code
+                        })
+
+                    query_params = {}
+                    cookies = {}
+                    for param in base_req_info.getParameters():
+                        if param.getType() == 0:
+                            query_params[param.getName()] = param.getValue()
+                        elif param.getType() == 2:
+                            cookies[param.getName()] = param.getValue()
+
+                    curl_cmd = self._generate_curl(base_req_info, base_request)
+                    python_template = self._generate_python(base_req_info, base_request, cookies)
+
+                    json_data.append({
+                        "id": issue_hash,
+                        "timestamp": scan_timestamp,
+                        "severity": severity,
+                        "confidence": confidence,
+                        "host": host,
+                        "url": url,
+                        "protocol": service.getProtocol(),
+                        "port": service.getPort(),
+                        "finding": issue_name,
+                        "description": issue.getIssueDetail() or "N/A",
+                        "background": issue.getIssueBackground() or "N/A",
+                        "remediation": issue.getRemediationDetail() or "N/A",
+                        "insertion_points": insertion_points,
+                        "http_evidence": http_evidence,
+                        "base_request": {
+                            "method": base_req_info.getMethod(),
+                            "path": base_req_info.getUrl().getPath(),
+                            "query_string": base_req_info.getUrl().getQuery(),
+                            "query_params": query_params,
+                            "headers": [str(h) for h in base_req_info.getHeaders()[:20]],
+                            "cookies": cookies,
+                            "body": self._helpers.bytesToString(base_request.getRequest()[base_req_info.getBodyOffset():base_req_info.getBodyOffset()+5000])
+                        },
+                        "curl_command": curl_cmd,
+                        "python_request_template": python_template
                     })
-                
-                # Extract query params and cookies
-                query_params = {}
-                cookies = {}
-                for param in base_req_info.getParameters():
-                    if param.getType() == 0:
-                        query_params[param.getName()] = param.getValue()
-                    elif param.getType() == 2:
-                        cookies[param.getName()] = param.getValue()
-                
-                # Generate curl command
-                curl_cmd = self._generate_curl(base_req_info, base_request)
-                
-                # Generate Python template
-                python_template = self._generate_python(base_req_info, base_request, cookies)
-                
-                json_data.append({
-                    "id": issue_hash,
-                    "timestamp": scan_timestamp,
-                    "severity": severity,
-                    "confidence": confidence,
-                    "host": host,
-                    "url": url,
-                    "protocol": service.getProtocol(),
-                    "port": service.getPort(),
-                    "finding": issue_name,
-                    "description": issue.getIssueDetail() or "N/A",
-                    "background": issue.getIssueBackground() or "N/A",
-                    "remediation": issue.getRemediationDetail() or "N/A",
-                    "insertion_points": insertion_points,
-                    "http_evidence": http_evidence,
-                    "base_request": {
-                        "method": base_req_info.getMethod(),
-                        "path": base_req_info.getUrl().getPath(),
-                        "query_string": base_req_info.getUrl().getQuery(),
-                        "query_params": query_params,
-                        "headers": [str(h) for h in base_req_info.getHeaders()[:20]],
-                        "cookies": cookies,
-                        "body": self._helpers.bytesToString(base_request.getRequest()[base_req_info.getBodyOffset():base_req_info.getBodyOffset()+5000])
-                    },
-                    "curl_command": curl_cmd,
-                    "python_request_template": python_template
-                })
-            except Exception as e:
-                self._callbacks.printError("Error: " + str(e))
-        
-        # Group and write files
-        import os
-        grouped = {}
-        for item in json_data:
-            sev = item["severity"]
-            conf = item["confidence"]
-            if sev not in grouped:
-                grouped[sev] = {}
-            if conf not in grouped[sev]:
-                grouped[sev][conf] = []
-            grouped[sev][conf].append(item)
-        
-        total = 0
-        for severity in ["High", "Medium"]:
-            if severity not in grouped:
-                continue
-            sev_dir = os.path.join(base_dir, severity)
-            File(sev_dir).mkdirs()
-            
-            for confidence in ["Certain", "Firm", "Tentative"]:
-                if confidence not in grouped[severity]:
-                    continue
-                
-                filename = os.path.join(sev_dir, confidence.lower() + ".json")
-                writer = None
-                try:
-                    writer = FileWriter(filename)
-                    writer.write(json.dumps(grouped[severity][confidence], indent=2))
-                    total += len(grouped[severity][confidence])
-                finally:
-                    if writer:
-                        try:
-                            writer.close()
-                        except Exception as e:
-                            self._callbacks.printError("Error closing file writer: " + str(e))
-        
-        # Generate stats
-        stats = {"scan_timestamp": scan_timestamp, "total_issues": len(json_data), "by_severity": {}, "by_confidence": {}, "by_host": {}}
-        for item in json_data:
-            stats["by_severity"][item["severity"]] = stats["by_severity"].get(item["severity"], 0) + 1
-            stats["by_confidence"][item["confidence"]] = stats["by_confidence"].get(item["confidence"], 0) + 1
-            stats["by_host"][item["host"]] = stats["by_host"].get(item["host"], 0) + 1
-        
-        stats_file = os.path.join(base_dir, "stats.json")
-        writer = None
-        try:
-            writer = FileWriter(stats_file)
-            writer.write(json.dumps(stats, indent=2))
-        finally:
-            if writer:
-                try:
-                    writer.close()
                 except Exception as e:
-                    self._callbacks.printError("Error closing stats writer: " + str(e))
-        
-        # Generate README
-        readme = "# Burp Export - {}\n\nTotal: {} issues\nHigh: {}\nMedium: {}\nHosts: {}\n\n".format(
-            scan_timestamp, len(json_data), stats["by_severity"].get("High", 0), 
-            stats["by_severity"].get("Medium", 0), len(stats["by_host"]))
-        for sev in ["High", "Medium"]:
-            if sev in grouped:
-                readme += "{}\\\n".format(sev)
-                for conf in ["Certain", "Firm", "Tentative"]:
-                    if conf in grouped[sev]:
-                        readme += "  {}.json ({})\n".format(conf.lower(), len(grouped[sev][conf]))
-        writer = None
-        try:
-            writer = FileWriter(os.path.join(base_dir, "README.txt"))
-            writer.write(readme)
-        finally:
-            if writer:
-                try:
-                    writer.close()
-                except Exception as e:
-                    self._callbacks.printError("Error closing README writer: " + str(e))
-        
-        # Generate test script
-        script_content = ""
-        script_name = "test.sh"
-        count = 0
-        
-        if os.name == 'nt':
-            script_content = "@echo off\necho Testing vulnerabilities...\necho.\n"
-            script_name = "test.bat"
-        else:
-            script_content = "#!/bin/bash\necho 'Testing vulnerabilities...'\necho\n"
-        
-        for sev in ["High", "Medium"]:
-            if sev not in grouped:
-                continue
-            for conf in ["Certain", "Firm"]:
+                    self._callbacks.printError("Error: " + str(e))
+
+            if self._is_export_cancelled():
+                self._run_on_ui(lambda: self._set_export_status("Export cancelled"))
+                return
+
+            grouped = {}
+            for item in json_data:
+                sev = item["severity"]
+                conf = item["confidence"]
+                if sev not in grouped:
+                    grouped[sev] = {}
                 if conf not in grouped[sev]:
+                    grouped[sev][conf] = []
+                grouped[sev][conf].append(item)
+
+            total = 0
+            for severity in ["High", "Medium"]:
+                if severity not in grouped:
                     continue
-                for issue in grouped[sev][conf][:5]:
-                    if issue.get("curl_command"):
-                        count += 1
-                        script_content += "echo '[{}] {}'\n".format(count, issue["finding"])
-                        script_content += "{}\n".format(issue["curl_command"])
-                        script_content += "echo\n"
-        
-        if os.name == 'nt':
-            script_content += "pause\n"
-        else:
-            script_content += "read -p 'Press Enter to continue...'\n"
-        
-        script_path = os.path.join(base_dir, script_name)
-        if self._write_file(script_path, script_content):
-            if os.name != 'nt':
-                try:
-                    import stat
-                    os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                except Exception as e:
-                    self._callbacks.printError("Error setting chmod: " + str(e))
-        
-        JOptionPane.showMessageDialog(self._panel, "Exported {} issues to:\n{}".format(total, base_dir), "Success", JOptionPane.INFORMATION_MESSAGE)
-        self._callbacks.printOutput("[+] Exported {} issues to {}".format(total, base_dir))
+                sev_dir = os.path.join(base_dir, severity)
+                File(sev_dir).mkdirs()
+
+                for confidence in ["Certain", "Firm", "Tentative"]:
+                    if confidence not in grouped[severity]:
+                        continue
+
+                    filename = os.path.join(sev_dir, confidence.lower() + ".json")
+                    writer = None
+                    try:
+                        writer = FileWriter(filename)
+                        writer.write(json.dumps(grouped[severity][confidence], indent=2))
+                        total += len(grouped[severity][confidence])
+                    finally:
+                        if writer:
+                            try:
+                                writer.close()
+                            except Exception as e:
+                                self._callbacks.printError("Error closing file writer: " + str(e))
+
+            stats = {"scan_timestamp": scan_timestamp, "total_issues": len(json_data), "by_severity": {}, "by_confidence": {}, "by_host": {}}
+            for item in json_data:
+                stats["by_severity"][item["severity"]] = stats["by_severity"].get(item["severity"], 0) + 1
+                stats["by_confidence"][item["confidence"]] = stats["by_confidence"].get(item["confidence"], 0) + 1
+                stats["by_host"][item["host"]] = stats["by_host"].get(item["host"], 0) + 1
+
+            stats_file = os.path.join(base_dir, "stats.json")
+            writer = None
+            try:
+                writer = FileWriter(stats_file)
+                writer.write(json.dumps(stats, indent=2))
+            finally:
+                if writer:
+                    try:
+                        writer.close()
+                    except Exception as e:
+                        self._callbacks.printError("Error closing stats writer: " + str(e))
+
+            readme = "# Burp Export - {}\n\nTotal: {} issues\nHigh: {}\nMedium: {}\nHosts: {}\n\n".format(
+                scan_timestamp, len(json_data), stats["by_severity"].get("High", 0),
+                stats["by_severity"].get("Medium", 0), len(stats["by_host"]))
+            for sev in ["High", "Medium"]:
+                if sev in grouped:
+                    readme += "{}\\\n".format(sev)
+                    for conf in ["Certain", "Firm", "Tentative"]:
+                        if conf in grouped[sev]:
+                            readme += "  {}.json ({})\n".format(conf.lower(), len(grouped[sev][conf]))
+            writer = None
+            try:
+                writer = FileWriter(os.path.join(base_dir, "README.txt"))
+                writer.write(readme)
+            finally:
+                if writer:
+                    try:
+                        writer.close()
+                    except Exception as e:
+                        self._callbacks.printError("Error closing README writer: " + str(e))
+
+            script_content = ""
+            script_name = "test.sh"
+            count = 0
+
+            if os.name == 'nt':
+                script_content = "@echo off\necho Testing vulnerabilities...\necho.\n"
+                script_name = "test.bat"
+            else:
+                script_content = "#!/bin/bash\necho 'Testing vulnerabilities...'\necho\n"
+
+            for sev in ["High", "Medium"]:
+                if sev not in grouped:
+                    continue
+                for conf in ["Certain", "Firm"]:
+                    if conf not in grouped[sev]:
+                        continue
+                    for issue in grouped[sev][conf][:5]:
+                        if issue.get("curl_command"):
+                            count += 1
+                            script_content += "echo '[{}] {}'\n".format(count, issue["finding"])
+                            script_content += "{}\n".format(issue["curl_command"])
+                            script_content += "echo\n"
+
+            if os.name == 'nt':
+                script_content += "pause\n"
+            else:
+                script_content += "read -p 'Press Enter to continue...'\n"
+
+            script_path = os.path.join(base_dir, script_name)
+            if self._write_file(script_path, script_content):
+                if os.name != 'nt':
+                    try:
+                        import stat
+                        os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+                    except Exception as e:
+                        self._callbacks.printError("Error setting chmod: " + str(e))
+
+            self._callbacks.printOutput("[+] Exported {} issues to {}".format(total, base_dir))
+            self._run_on_ui(lambda total_count=total, out_dir=base_dir: JOptionPane.showMessageDialog(
+                self._panel,
+                "Exported {} issues to:\n{}".format(total_count, out_dir),
+                "Success",
+                JOptionPane.INFORMATION_MESSAGE
+            ))
+            self._run_on_ui(lambda: self._set_export_status("Export completed: {} issues".format(total)))
+        except Exception as e:
+            self._callbacks.printError("Export failed: " + str(e))
+            self._run_on_ui(lambda err=str(e): JOptionPane.showMessageDialog(
+                self._panel,
+                "Export failed:\n{}".format(err),
+                "Error",
+                JOptionPane.ERROR_MESSAGE
+            ))
+            self._run_on_ui(lambda: self._set_export_status("Export failed"))
+        finally:
+            self._finish_export()
     
     def _generate_curl(self, req_info, request):
         method = req_info.getMethod()
@@ -821,21 +962,24 @@ Remediation:
         return " [{}]".format(",".join(tags)) if tags else ""
     
     def _on_selection_change(self):
-        idx = self.issue_list.getSelectedIndex()
-        if idx >= 0:
-            key = self.list_model.getElementAt(idx)
-            issue_data = self.issues_cache.get(key)
-            if issue_data:
-                issue_id = issue_data.get("id")
-                status = self.issue_status.get(issue_id, {})
-                self.tested_cb.setSelected(status.get("tested", False))
-                self.exploited_cb.setSelected(status.get("exploited", False))
-                self.fp_cb.setSelected(status.get("fp", False))
+        key = self._get_selected_issue_key()
+        if not key:
+            self.tested_cb.setSelected(False)
+            self.exploited_cb.setSelected(False)
+            self.fp_cb.setSelected(False)
+            return
+
+        issue_data = self.issues_cache.get(key)
+        if issue_data:
+            issue_id = issue_data.get("id")
+            status = self.issue_status.get(issue_id, {})
+            self.tested_cb.setSelected(status.get("tested", False))
+            self.exploited_cb.setSelected(status.get("exploited", False))
+            self.fp_cb.setSelected(status.get("fp", False))
     
     def _update_status(self):
-        idx = self.issue_list.getSelectedIndex()
-        if idx >= 0:
-            key = self.list_model.getElementAt(idx)
+        key = self._get_selected_issue_key()
+        if key:
             issue_data = self.issues_cache.get(key)
             if issue_data:
                 issue_id = issue_data.get("id")
@@ -847,9 +991,8 @@ Remediation:
                 self._save_status()
     
     def _clear_status(self):
-        idx = self.issue_list.getSelectedIndex()
-        if idx >= 0:
-            key = self.list_model.getElementAt(idx)
+        key = self._get_selected_issue_key()
+        if key:
             issue_data = self.issues_cache.get(key)
             if issue_data:
                 issue_id = issue_data.get("id")
@@ -872,15 +1015,21 @@ class AlternatingRowRenderer(ListCellRenderer):
         self.extender = extender
     
     def getListCellRendererComponent(self, list, value, index, isSelected, cellHasFocus):
+        row = None
+        if index >= 0 and index < len(self.extender.displayed_rows):
+            row = self.extender.displayed_rows[index]
+        is_header = row and row.get("type") == "header"
+        issue_key = row.get("issue_key") if row else None
+
         panel = JPanel()
         panel.setLayout(BoxLayout(panel, BoxLayout.X_AXIS))
         panel.setOpaque(True)
         
         text_label = JLabel(str(value))
-        text_label.setFont(Font("Monospaced", Font.PLAIN, 12))
+        text_label.setFont(Font("Monospaced", Font.BOLD if is_header else Font.PLAIN, 12))
         panel.add(text_label)
         
-        if index not in self.extender.duplicate_indices:
+        if issue_key and issue_key not in self.extender.duplicate_issue_keys:
             panel.add(Box.createHorizontalGlue())
             unique_label = JLabel("[UNIQUE]")
             unique_label.setFont(Font("Monospaced", Font.BOLD, 12))
@@ -890,7 +1039,10 @@ class AlternatingRowRenderer(ListCellRenderer):
         if isSelected:
             panel.setBackground(Color(184, 207, 229))
             text_label.setForeground(Color.BLACK)
-        elif index in self.extender.copied_indices:
+        elif is_header:
+            panel.setBackground(Color(232, 232, 232))
+            text_label.setForeground(Color(60, 60, 60))
+        elif issue_key and issue_key in self.extender.copied_issue_keys:
             panel.setBackground(Color(200, 255, 200))
             text_label.setForeground(Color.BLACK)
         elif index % 2 == 0:
@@ -908,28 +1060,29 @@ class DoubleClickListener(MouseAdapter):
     
     def mouseClicked(self, event):
         if event.getClickCount() == 2:
-            idx = self.extender.issue_list.getSelectedIndex()
-            if idx >= 0:
-                key = self.extender.list_model.getElementAt(idx)
-                issue_data = self.extender.issues_cache.get(key)
-                if issue_data:
-                    try:
-                        prompt = issue_data.get("prompt")
-                        if not prompt:
-                            prompt = self.extender._build_issue_prompt(issue_data.get("issue"))
-                            issue_data["prompt"] = prompt
+            key = self.extender._get_selected_issue_key()
+            if not key:
+                return
 
-                        if not prompt:
-                            raise ValueError("No prompt data available")
+            issue_data = self.extender.issues_cache.get(key)
+            if issue_data:
+                try:
+                    prompt = issue_data.get("prompt")
+                    if not prompt:
+                        prompt = self.extender._build_issue_prompt(issue_data.get("issue"))
+                        issue_data["prompt"] = prompt
 
-                        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(prompt), None)
-                        self.extender.copied_indices.add(idx)
-                        self.extender.issue_list.repaint()
-                        JOptionPane.showMessageDialog(self.extender._panel, "Copied to clipboard!", "Success", JOptionPane.INFORMATION_MESSAGE)
-                    except Exception as e:
-                        JOptionPane.showMessageDialog(self.extender._panel, "Failed: " + str(e), "Error", JOptionPane.ERROR_MESSAGE)
-                else:
-                    JOptionPane.showMessageDialog(self.extender._panel, "No data found", "Error", JOptionPane.ERROR_MESSAGE)
+                    if not prompt:
+                        raise ValueError("No prompt data available")
+
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(StringSelection(prompt), None)
+                    self.extender.copied_issue_keys.add(key)
+                    self.extender.issue_list.repaint()
+                    JOptionPane.showMessageDialog(self.extender._panel, "Copied to clipboard!", "Success", JOptionPane.INFORMATION_MESSAGE)
+                except Exception as e:
+                    JOptionPane.showMessageDialog(self.extender._panel, "Failed: " + str(e), "Error", JOptionPane.ERROR_MESSAGE)
+            else:
+                JOptionPane.showMessageDialog(self.extender._panel, "No data found", "Error", JOptionPane.ERROR_MESSAGE)
 
 class SearchListener(DocumentListener):
     def __init__(self, extender):

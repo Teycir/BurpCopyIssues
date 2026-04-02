@@ -81,15 +81,17 @@ Interactive UI extension for browsing, copying, and exporting scan findings.
 - Double-click to copy full issue details to clipboard
 - Copied issues turn light green until refresh
 - Refresh button to reload current filter
+- Background export with live status and `Cancel Export` support
 - Status tracking with checkboxes (Tested/Exploited/False Positive)
 - Duplicate highlighting - unique issues show **[UNIQUE]** in bold green on right
+- Group-by-host headers are non-actionable rows (copy/status actions stay issue-safe)
 - Export all issues to JSON with full HTTP evidence
 
 **Usage:**
 - Click severity/confidence filter → Double-click issue → Copy to clipboard
 - Use checkboxes to mark status (Tested/Exploited/False Positive)
 - Click "Refresh" to reload findings
-- Click "Export All" for JSON export with full HTTP evidence
+- Click "Export All" for JSON export with full HTTP evidence (use "Cancel Export" to stop)
 
 <p align="center">
   <img src="Assets/groupbyhost.png" alt="Group by Host">
@@ -173,7 +175,8 @@ Displays all High and Medium severity issues detected by Burp Scanner, including
   - Unique issues: Bold green **[UNIQUE]** marker on right
 - **Status Persistence**: Saved to `~/burp_exports/issue_status.json` (or `C:\burp_exports\` on Windows)
 - **Cross-platform**: Works on Windows, Linux, and macOS
-- **Performance**: Limited to first 2 HTTP messages per issue, 20 headers max
+- **Count Refresh**: Background count refresh every 15s + scanner-listener cache invalidation
+- **Performance**: Async issue loading/export, prompt generation on-demand, and export limited to first 2 HTTP messages per issue with 20 headers max
 
 
 ## Author
